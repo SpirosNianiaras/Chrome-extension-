@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="el">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Tab Companion - Test Page</title>
+    <meta name="description" content="Test page για το AI Tab Companion extension">
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            line-height: 1.6;
+        }
+        .header {
+            background: linear-gradient(135deg, #4285F4 0%, #1a73e8 100%);
+            color: white;
+            padding: 20px;
+            border-radius: 10px;
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        .section {
+            background: #f8f9fa;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+        .highlight {
+            background: #e8f0fe;
+            padding: 15px;
+            border-radius: 6px;
+            border-left: 4px solid #4285F4;
+            margin: 20px 0;
+        }
+        .code {
+            background: #f1f3f4;
+            padding: 10px;
+            border-radius: 4px;
+            font-family: monospace;
+            margin: 10px 0;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🧠 AI Tab Companion - Test Page</h1>
+        <p>Αυτή είναι μια test σελίδα για το AI Tab Companion extension</p>
+    </div>
+
+    <div class="section">
+        <h2>📋 Τι να κάνεις</h2>
+        <ol>
+            <li><strong>Φόρτωσε το extension</strong> στο Chrome (chrome://extensions/)</li>
+            <li><strong>Άνοιξε αυτή τη σελίδα</strong> σε πολλά tabs</li>
+            <li><strong>Άνοιξε και άλλες σελίδες</strong> (Google, Wikipedia, GitHub, κλπ.)</li>
+            <li><strong>Κάνε κλικ στο extension icon</strong> στη γραμμή εργαλείων</li>
+            <li><strong>Κάνε κλικ "Σκάναρε Tabs"</strong></li>
+            <li><strong>Δες τα αποτελέσματα!</strong></li>
+        </ol>
+    </div>
+
+    <div class="section">
+        <h2>🤖 Chrome Built-in AI APIs</h2>
+        <p>Το extension χρησιμοποιεί τα Chrome Built-in AI APIs:</p>
+        <div class="code">
+            // Prompt API για ομαδοποίηση
+            const languageModelFactory = self.LanguageModel ?? self.ai?.languageModel ?? self.aiOriginTrial?.languageModel ?? window.ai?.languageModel;
+            const languageModel = await languageModelFactory.create();
+            const response = await languageModel.prompt("Group these tabs...");
+            
+            // Summarizer API για συνοψίσεις
+            const summarizerFactory = self.Summarizer ?? self.ai?.summarizer ?? self.ai?.Summarizer ?? self.aiOriginTrial?.summarizer ?? window.ai?.Summarizer;
+            const summarizer = await summarizerFactory.create();
+            const summary = await summarizer.summarize(groupContent);
+        </div>
+    </div>
+
+    <div class="section">
+        <h2>🎯 Expected Results</h2>
+        <div class="highlight">
+            <h3>Αν το Chrome AI είναι διαθέσιμο:</h3>
+            <ul>
+                <li>Intelligent grouping κατά θέμα</li>
+                <li>AI-generated summaries</li>
+                <li>Smart categories (Research, Work, Social, κλπ.)</li>
+            </ul>
+        </div>
+        
+        <div class="highlight">
+            <h3>Αν το Chrome AI δεν είναι διαθέσιμο:</h3>
+            <ul>
+                <li>Domain-based grouping</li>
+                <li>Basic summaries</li>
+                <li>Categories κατά domain (google.com, wikipedia.org, κλπ.)</li>
+            </ul>
+        </div>
+    </div>
+
+    <div class="section">
+        <h2>🔧 Debug Information</h2>
+        <p>Αν κάτι δεν δουλεύει:</p>
+        <ol>
+            <li>Πάτησε <strong>F12</strong> για να ανοίξεις το Developer Tools</li>
+            <li>Πήγαινε στο <strong>Console</strong> tab</li>
+            <li>Ψάξε για messages που αρχίζουν με "AI Tab Companion"</li>
+            <li>Ψάξε για error messages</li>
+        </ol>
+    </div>
+
+    <div class="section">
+        <h2>📊 Test Data</h2>
+        <p>Αυτή η σελίδα περιέχει:</p>
+        <ul>
+            <li><strong>Title:</strong> "AI Tab Companion - Test Page"</li>
+            <li><strong>Description:</strong> "Test page για το AI Tab Companion extension"</li>
+            <li><strong>Content:</strong> Πληροφορίες για το extension και testing</li>
+            <li><strong>Keywords:</strong> AI, Chrome, Extension, Testing</li>
+        </ul>
+    </div>
+
+    <div class="section">
+        <h2>🚀 Ready to Test!</h2>
+        <p>Το extension είναι έτοιμο για testing. Ακολούθησε τα βήματα παραπάνω και δες πώς λειτουργεί!</p>
+        
+        <div class="highlight">
+            <strong>💡 Tip:</strong> Άνοιξε αυτή τη σελίδα σε 3-4 διαφορετικά tabs και μετά δοκίμασε το extension για να δεις πώς ομαδοποιεί τα tabs!
+        </div>
+    </div>
+
+    <footer style="text-align: center; margin-top: 40px; padding: 20px; background: #f8f9fa; border-radius: 8px;">
+        <p>&copy; 2024 AI Tab Companion - Test Page</p>
+        <p>Built with ❤️ for Chrome Built-in AI Challenge</p>
+    </footer>
+</body>
+</html>

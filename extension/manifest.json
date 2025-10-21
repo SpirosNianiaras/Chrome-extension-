@@ -1,0 +1,58 @@
+{
+  "manifest_version": 3,
+  "name": "AI Tab Companion",
+  "version": "1.0.0",
+  "description": "Χρησιμοποιεί το built-in AI του Chrome για να αναλύει, ομαδοποιεί και συνοψίζει τα ανοιχτά tabs",
+  
+  "permissions": [
+    "tabs",
+    "tabGroups",
+    "windows",
+    "scripting", 
+    "activeTab",
+    "storage"
+  ],
+  
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  
+  "background": {
+    "service_worker": "background.js"
+  },
+  
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "AI Tab Companion",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png", 
+      "128": "icons/icon128.png"
+    }
+  },
+  
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  
+  "web_accessible_resources": [
+    {
+      "resources": ["icons/*"],
+      "matches": ["<all_urls>"]
+    }
+  ],
+  
+  "trial_tokens": [
+    "A8PdaWdLbWTHZ7KSEzrXqNdGWzv1kwa1503SSgk5od6xkPG+pHAwzQs3NNWWxrlQoZaYtc2WoIRtAsQpJ98a2Q0AAAByeyJvcmlnaW4iOiJodHRwczovL2xvY2FsaG9zdDozMDAwIiwiZmVhdHVyZSI6IkFJUHJvbXB0QVBJTXVsdGltb2RhbElucHV0IiwiZXhwaXJ5IjoxNzc0MzEwNDAwLCJpc1RoaXJkUGFydHkiOnRydWV9"
+  ]
+}

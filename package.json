@@ -1,0 +1,59 @@
+{
+  "name": "ai-tab-companion",
+  "version": "1.0.0",
+  "description": "Chrome Extension που χρησιμοποιεί το built-in AI του Chrome (Gemini Nano APIs) για να αναλύει, ομαδοποιεί και συνοψίζει τα ανοιχτά tabs",
+  "main": "extension/background.js",
+  "scripts": {
+    "build": "echo 'No build process needed for this extension'",
+    "test": "echo 'No tests specified'",
+    "lint": "echo 'Linting not configured'",
+    "package": "cd extension && zip -r ../ai-tab-companion.zip .",
+    "dev": "echo 'Load extension in Chrome developer mode'"
+  },
+  "keywords": [
+    "chrome-extension",
+    "ai",
+    "gemini-nano",
+    "tabs",
+    "organization",
+    "productivity",
+    "chrome-ai",
+    "manifest-v3"
+  ],
+  "author": "AI Tab Companion Team",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/your-username/ai-tab-companion.git"
+  },
+  "bugs": {
+    "url": "https://github.com/your-username/ai-tab-companion/issues"
+  },
+  "homepage": "https://github.com/your-username/ai-tab-companion#readme",
+  "engines": {
+    "chrome": ">=88.0.0"
+  },
+  "devDependencies": {},
+  "dependencies": {},
+  "manifest": {
+    "version": 3,
+    "permissions": [
+      "tabs",
+      "scripting",
+      "activeTab",
+      "storage"
+    ],
+    "host_permissions": [
+      "<all_urls>"
+    ]
+  },
+  "files": [
+    "extension/",
+    "README.md",
+    "LICENSE",
+    "INSTALLATION.md",
+    "demo-script.md"
+  ]
+}
+
+

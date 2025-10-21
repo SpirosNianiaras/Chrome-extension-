@@ -1,0 +1,30 @@
+<svg width="128" height="128" viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg">
+  <!-- Background circle -->
+  <circle cx="64" cy="64" r="60" fill="#4285F4" stroke="#1a73e8" stroke-width="4"/>
+  
+  <!-- Brain/AI symbol -->
+  <path d="M45 45 Q64 35 83 45 Q88 50 85 60 Q82 70 75 75 Q70 80 64 78 Q58 80 53 75 Q46 70 43 60 Q40 50 45 45 Z" fill="white"/>
+  
+  <!-- Neural network dots -->
+  <circle cx="50" cy="55" r="3" fill="#4285F4"/>
+  <circle cx="64" cy="50" r="3" fill="#4285F4"/>
+  <circle cx="78" cy="55" r="3" fill="#4285F4"/>
+  <circle cx="55" cy="70" r="3" fill="#4285F4"/>
+  <circle cx="73" cy="70" r="3" fill="#4285F4"/>
+  
+  <!-- Connection lines -->
+  <line x1="50" y1="55" x2="64" y2="50" stroke="#4285F4" stroke-width="2"/>
+  <line x1="64" y1="50" x2="78" y2="55" stroke="#4285F4" stroke-width="2"/>
+  <line x1="50" y1="55" x2="55" y2="70" stroke="#4285F4" stroke-width="2"/>
+  <line x1="78" y1="55" x2="73" y2="70" stroke="#4285F4" stroke-width="2"/>
+  
+  <!-- Tab symbol -->
+  <rect x="30" y="85" width="25" height="15" rx="3" fill="white" stroke="#1a73e8" stroke-width="2"/>
+  <rect x="35" y="90" width="15" height="5" fill="#4285F4"/>
+  
+  <rect x="60" y="85" width="25" height="15" rx="3" fill="white" stroke="#1a73e8" stroke-width="2"/>
+  <rect x="65" y="90" width="15" height="5" fill="#4285F4"/>
+  
+  <rect x="90" y="85" width="25" height="15" rx="3" fill="white" stroke="#1a73e8" stroke-width="2"/>
+  <rect x="95" y="90" width="15" height="5" fill="#4285F4"/>
+</svg>
