@@ -1,0 +1,14 @@
+{
+  "name": "S2_gaming_shop_trap",
+  "tabs": [
+    {"url": "https://www.ea.com/games/ea-sports-fc/fc-24/ultimate-team/features", "gold": "gaming"},
+    {"url": "https://www.futbin.com/25/players", "gold": "gaming"},
+    {"url": "https://www.fut.gg/squad-builder/", "gold": "gaming"},
+    {"url": "https://www.reddit.com/r/FIFA/", "gold": "gaming-community"},
+    {"url": "https://www.amazon.com/s?k=gaming+chair", "gold": "shopping"},
+    {"url": "https://www.ebay.com/b/PC-Gaming-Accessories/175748/bn_7115495208", "gold": "shopping"},
+    {"url": "https://www.bestbuy.com/site/video-games/gaming-laptops/pcmcat287600050003.c?id=pcmcat287600050003", "gold": "shopping"},
+    {"url": "https://www.target.com/c/video-games-consoles/-/N-5xtg5", "gold": "shopping"}
+  ],
+  "notes": "Ultimate Team research must stay separate from commerce tabs that sell hardware/accessories."
+}

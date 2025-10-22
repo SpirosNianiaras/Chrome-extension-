@@ -1,0 +1,14 @@
+{
+  "name": "S1_medical_ai_mix",
+  "tabs": [
+    {"url": "https://www.nejm.org/toc/nejm/recently-published", "gold": "medical"},
+    {"url": "https://pubmed.ncbi.nlm.nih.gov/", "gold": "medical"},
+    {"url": "https://www.medicalnewstoday.com/", "gold": "medical"},
+    {"url": "https://techcrunch.com/category/artificial-intelligence/", "gold": "ai-news"},
+    {"url": "https://www.theverge.com/ai-artificial-intelligence", "gold": "ai-news"},
+    {"url": "https://www.who.int/health-topics/research#tab=tab_1", "gold": "generic-medical"},
+    {"url": "https://openai.com/news/", "gold": "company-ai"},
+    {"url": "https://blog.google/technology/ai/", "gold": "company-ai"}
+  ],
+  "notes": "Medical research vs AI news; portals should not bridge specialty and company feeds."
+}

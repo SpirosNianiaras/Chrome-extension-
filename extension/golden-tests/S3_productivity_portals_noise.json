@@ -1,0 +1,14 @@
+{
+  "name": "S3_productivity_portals_noise",
+  "tabs": [
+    {"url": "https://docs.google.com/spreadsheets/u/0/", "gold": "docs-suite"},
+    {"url": "https://docs.google.com/document/u/0/", "gold": "docs-suite"},
+    {"url": "https://www.notion.so/templates", "gold": "workspace-portal"},
+    {"url": "https://www.atlassian.com/software/confluence", "gold": "workspace-portal"},
+    {"url": "https://mail.google.com/mail/u/0/#inbox", "gold": "email"},
+    {"url": "https://calendar.google.com/calendar/u/0/r", "gold": "calendar"},
+    {"url": "https://news.google.com/", "gold": "news-noise"},
+    {"url": "https://www.youtube.com/", "gold": "media-noise"}
+  ],
+  "notes": "Productivity docs vs workspace portals vs communication; news/video noise should not merge into work clusters."
+}
