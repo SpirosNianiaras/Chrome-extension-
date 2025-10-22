@@ -4,11 +4,36 @@
  * και την ενσωμάτωση με το Chrome AI (Gemini Nano)
  */
 
+// ---- Boot banner (local dev visibility) ----
+try {
+    const manifest = (typeof chrome !== 'undefined' && chrome.runtime && typeof chrome.runtime.getManifest === 'function')
+        ? chrome.runtime.getManifest()
+        : { name: 'AI Tab Companion', version: 'dev' };
+    console.log(`🚀 [Boot] ${manifest.name} v${manifest.version} background loaded @ ${new Date().toLocaleString()}`);
+} catch (_) {
+    // no-op
+}
+
+if (typeof chrome !== 'undefined' && chrome.runtime) {
+    if (chrome.runtime.onStartup && typeof chrome.runtime.onStartup.addListener === 'function') {
+        chrome.runtime.onStartup.addListener(() => {
+            console.log('🔁 [Boot] Chrome runtime startup event; service worker active');
+        });
+    }
+    if (chrome.runtime.onSuspend && typeof chrome.runtime.onSuspend.addListener === 'function') {
+        chrome.runtime.onSuspend.addListener(() => {
+            console.log('🛑 [Boot] Runtime suspend (service worker going idle)');
+        });
+    }
+}
+
 // Global state για το extension
 let isScanning = false;
 let currentTabData = [];
 let aiGroups = [];
 let scanTimeout = null; // Για debounce
+let lastMergeDebugLog = null;
+let lastGoldenEvaluation = null;
 
 // Tunable constants για επιδόσεις και ακρίβεια
 const CONTENT_EXTRACTION_CONCURRENCY = 8;
@@ -22,15 +47,31 @@ const CROSS_GROUP_TAXONOMY_OVERLAP = 0.5;
 const SMALL_GROUP_MAX_SIZE = 3;
 const GROUP_NAME_SIMILARITY_THRESHOLD = 0.62;
 const GROUP_NAME_VECTOR_THRESHOLD = 0.5;
+const ENABLE_MERGE_DEBUG_LOGS = true;
+const ENFORCE_AI_FEATURES = true;
+const LLM_VERIFICATION_CONFIDENCE = 0.58;
+const LLM_MERGE_SIMILARITY_FLOOR = 0.34;
+const LLM_VERIFICATION_TIMEOUT = 11000;
+const GENERIC_MERGE_STOPWORDS = new Set([
+    'research',
+    'news',
+    'blog',
+    'updates',
+    'topics',
+    'portal',
+    'general',
+    'overview'
+]);
 const EMBEDDING_MIN_CONTENT_CHARS = 160;
 const EMBEDDING_CACHE_TTL = 15 * 60 * 1000;
 const EMBEDDING_MAX_TOKENS = 600;
 const EMBEDDING_FALLBACK_DIM = 64;
 const TFIDF_TOKEN_LIMIT = 24;
 const LABEL_CACHE_TTL = 60 * 60 * 1000; // 1 hour
-const MAX_AI_FEATURE_TABS = 6;
+const MAX_AI_FEATURE_TABS = 12;
 const MAX_AI_EMBED_TABS = 12;
 const MAX_AI_LABEL_GROUPS = 5;
+const PAIRWISE_LLM_CACHE = new Map();
 const RESTRICTED_HOSTS = [
     'mail.google.com',
     'accounts.google.com',
@@ -38,6 +79,11 @@ const RESTRICTED_HOSTS = [
     'play.google.com',
     'outlook.live.com'
 ];
+
+const DEFAULT_WORKING_LANGUAGE = 'en';
+const SIMHASH_BITS = 32;
+const GROUP_AUTOSUSPEND_IDLE_MS = 5 * 60 * 1000;
+const GROUP_AUTOSUSPEND_CHECK_MS = 90 * 1000;
 
 const TAXONOMY_RULES = [
     { match: /youtube\.com|youtu\.be/i, tags: ['media', 'video', 'youtube'] },
@@ -56,9 +102,9 @@ const TAXONOMY_RULES = [
 ];
 
 const HAS_PERFORMANCE_API = typeof performance !== 'undefined' && typeof performance.now === 'function';
-const AI_FEATURE_TIMEOUT = 4500;
-const AI_LABEL_TIMEOUT = 3500;
-const AI_SUMMARY_TIMEOUT = 9000;
+const AI_FEATURE_TIMEOUT = 18000;
+const AI_LABEL_TIMEOUT = 8000;
+const AI_SUMMARY_TIMEOUT = 16000;
 function nowMs() {
     return HAS_PERFORMANCE_API ? performance.now() : Date.now();
 }
@@ -74,6 +120,196 @@ function logTiming(label, startTime) {
 
 let deferredSummaryTimer = null;
 let deferredSummaryInProgress = false;
+const groupActivityState = new Map();
+let autoSuspendTimer = null;
+
+function buildDetectionSample(text) {
+    if (!text) {
+        return '';
+    }
+    return String(text)
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 1200);
+}
+
+async function detectLanguageForText(text) {
+    if (!text || typeof chrome?.i18n?.detectLanguage !== 'function') {
+        return null;
+    }
+    const sample = buildDetectionSample(text);
+    if (!sample) {
+        return null;
+    }
+    return new Promise(resolve => {
+        try {
+            chrome.i18n.detectLanguage(sample, (result) => {
+                if (chrome.runtime.lastError) {
+                    console.warn('Language detection failed:', chrome.runtime.lastError.message);
+                    resolve(null);
+                    return;
+                }
+                const languages = Array.isArray(result?.languages) ? result.languages : [];
+                const candidates = languages
+                    .filter(item => item && item.language && item.language !== 'und')
+                    .sort((a, b) => (b.percentage || 0) - (a.percentage || 0));
+                if (candidates.length > 0) {
+                    resolve(candidates[0].language);
+                    return;
+                }
+                resolve(null);
+            });
+        } catch (error) {
+            console.warn('Language detection threw:', error);
+            resolve(null);
+        }
+    });
+}
+
+async function ensureEntryLanguage(entry) {
+    if (!entry || typeof entry !== 'object') {
+        return DEFAULT_WORKING_LANGUAGE;
+    }
+    const existing = String(entry.language || entry.detectedLanguage || '')
+        .toLowerCase()
+        .trim();
+    if (existing && existing !== 'und') {
+        return existing;
+    }
+    const detectionSources = [
+        entry.fullContent,
+        entry.content,
+        entry.metaDescription,
+        Array.isArray(entry.headings) ? entry.headings.join(' ') : '',
+        entry.title
+    ].filter(Boolean);
+    const sample = buildDetectionSample(detectionSources.join(' '));
+    if (!sample) {
+        return DEFAULT_WORKING_LANGUAGE;
+    }
+    try {
+        const detected = await detectLanguageForText(sample);
+        return detected || DEFAULT_WORKING_LANGUAGE;
+    } catch (error) {
+        console.warn('ensureEntryLanguage failed:', error);
+        return DEFAULT_WORKING_LANGUAGE;
+    }
+}
+
+function recordGroupActivity(groupId, { resetSuspension = true } = {}) {
+    if (typeof chrome === 'undefined' || !chrome.tabGroups) {
+        return;
+    }
+    if (typeof groupId !== 'number' || groupId === chrome.tabGroups.TAB_GROUP_ID_NONE) {
+        return;
+    }
+    const now = Date.now();
+    const state = groupActivityState.get(groupId) || {};
+    const wasSuspended = Boolean(state.suspended);
+    state.lastActive = now;
+    if (typeof state.suspended !== 'boolean') {
+        state.suspended = false;
+    }
+    if (resetSuspension) {
+        state.suspended = false;
+    }
+    groupActivityState.set(groupId, state);
+    if (Array.isArray(aiGroups)) {
+        const aiGroup = aiGroups.find(group => group && group.chromeGroupId === groupId);
+        if (aiGroup) {
+            aiGroup.lastActive = now;
+            if (resetSuspension) {
+                aiGroup.autoSuspended = false;
+            }
+        }
+    }
+    if (resetSuspension && wasSuspended) {
+        chrome.tabGroups.update(groupId, { collapsed: false }).catch(() => {});
+    }
+}
+
+async function autoSuspendInactiveGroups() {
+    if (typeof chrome === 'undefined' || !chrome.tabGroups || !chrome.tabs) {
+        return;
+    }
+    try {
+        const now = Date.now();
+        const groups = await chrome.tabGroups.query({});
+        if (!Array.isArray(groups) || !groups.length) {
+            return;
+        }
+        const activeTabs = await chrome.tabs.query({ active: true });
+        const activeGroupIds = new Set(
+            activeTabs
+                .map(tab => tab.groupId)
+                .filter(groupId => typeof groupId === 'number' && groupId !== chrome.tabGroups.TAB_GROUP_ID_NONE)
+        );
+        for (const group of groups) {
+            const groupId = group?.id;
+            if (typeof groupId !== 'number' || groupId === chrome.tabGroups.TAB_GROUP_ID_NONE) {
+                continue;
+            }
+            const state = groupActivityState.get(groupId) || { lastActive: now, suspended: false };
+            if (activeGroupIds.has(groupId)) {
+                state.lastActive = now;
+                if (state.suspended) {
+                    state.suspended = false;
+                    if (Array.isArray(aiGroups)) {
+                        const activeGroup = aiGroups.find(item => item && item.chromeGroupId === groupId);
+                        if (activeGroup) {
+                            activeGroup.autoSuspended = false;
+                        }
+                    }
+                }
+                groupActivityState.set(groupId, state);
+                continue;
+            }
+            const idleDuration = now - (state.lastActive || now);
+            if (idleDuration < GROUP_AUTOSUSPEND_IDLE_MS || state.suspended) {
+                groupActivityState.set(groupId, state);
+                continue;
+            }
+            const tabs = await chrome.tabs.query({ groupId });
+            const discardableTabs = tabs.filter(tab => tab && !tab.active && !tab.pinned && !tab.audible);
+            if (!discardableTabs.length) {
+                continue;
+            }
+            await Promise.all(discardableTabs.map(tab => chrome.tabs.discard(tab.id).catch(() => {})));
+            try {
+                await chrome.tabGroups.update(groupId, { collapsed: true });
+            } catch (updateError) {
+                console.warn('Failed to collapse group after suspend:', updateError);
+            }
+            state.suspended = true;
+            state.lastActive = now;
+            groupActivityState.set(groupId, state);
+            if (Array.isArray(aiGroups)) {
+                const aiGroup = aiGroups.find(item => item && item.chromeGroupId === groupId);
+                if (aiGroup) {
+                    aiGroup.autoSuspended = true;
+                }
+            }
+            console.log(`Auto-suspended group ${group.title || groupId} after ${(idleDuration / 1000).toFixed(0)}s idle`);
+        }
+    } catch (error) {
+        console.warn('Auto-suspend check failed:', error);
+    }
+}
+
+function startAutoSuspendScheduler() {
+    if (autoSuspendTimer || typeof chrome === 'undefined') {
+        return;
+    }
+    autoSuspendTimer = setInterval(() => {
+        autoSuspendInactiveGroups().catch(error => {
+            console.warn('Auto-suspend interval error:', error);
+        });
+    }, GROUP_AUTOSUSPEND_CHECK_MS);
+    // Kick off first run after short delay
+    setTimeout(() => {
+        autoSuspendInactiveGroups().catch(error => console.warn('Initial auto-suspend check failed:', error));
+    }, GROUP_AUTOSUSPEND_CHECK_MS / 2);
+}
 
 async function withTimeout(promise, timeoutMs, timeoutMessage) {
     let timeoutId;
@@ -108,6 +344,38 @@ chrome.runtime.onInstalled.addListener(() => {
     chrome.storage.local.remove(['lastScan', 'cachedGroups']);
 });
 
+if (chrome.tabs?.onActivated) {
+    chrome.tabs.onActivated.addListener(({ tabId }) => {
+        if (!tabId || typeof chrome === 'undefined') {
+            return;
+        }
+        chrome.tabs.get(tabId, (tab) => {
+            if (chrome.runtime.lastError || !tab) {
+                return;
+            }
+            if (typeof tab.groupId === 'number' && tab.groupId !== chrome.tabGroups.TAB_GROUP_ID_NONE) {
+                recordGroupActivity(tab.groupId, { resetSuspension: true });
+            }
+        });
+    });
+}
+
+if (chrome.tabGroups?.onRemoved) {
+    chrome.tabGroups.onRemoved.addListener((group) => {
+        const groupId = typeof group === 'number' ? group : (group?.groupId ?? null);
+        if (typeof groupId === 'number') {
+            groupActivityState.delete(groupId);
+            if (Array.isArray(aiGroups)) {
+                const idx = aiGroups.findIndex(item => item && item.chromeGroupId === groupId);
+                if (idx !== -1 && aiGroups[idx]) {
+                    aiGroups[idx].chromeGroupId = undefined;
+                    aiGroups[idx].autoSuspended = false;
+                }
+            }
+        }
+    });
+}
+
 /**
  * Χειρισμός μηνυμάτων από popup και content scripts
  */
@@ -137,6 +405,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 .catch(error => {
                     console.error('REQUEST_GROUP_SUMMARY failed:', error);
                     sendResponse({ success: false, error: error.message });
+                });
+            return true;
+        
+        case 'RUN_GOLDEN_EVAL':
+            runGoldenEvaluation(message.scenario, { groups: message.groups, tabData: message.tabData })
+                .then(result => sendResponse({ success: true, result }))
+                .catch(error => {
+                    console.error('RUN_GOLDEN_EVAL failed:', error);
+                    sendResponse({ success: false, error: error.message, details: error.details || null });
                 });
             return true;
             
@@ -364,6 +641,9 @@ async function handleScanTabs(sendResponse) {
                 language: '',
                 contentHash: '',
                 youtubeAnalysis: null,
+                summaryBullets: [],
+                classification: null,
+                semanticFeatures: null,
                 topicHints: 'Topic: Pending extraction'
             };
         });
@@ -753,9 +1033,9 @@ function handleTabDataExtracted(data, sendResponse) {
  * Εκτελεί AI ανάλυση των tabs χρησιμοποιώντας Chrome Built-in AI APIs
  */
 async function performAIAnalysis() {
+    let aiStart = nowMs();
     try {
         console.log('Starting AI analysis with Chrome Built-in AI...');
-        const aiStart = nowMs();
         
         // Έλεγχος διαθεσιμότητας Chrome Built-in AI APIs
         // Χρησιμοποιούμε content script για πρόσβαση στα Chrome AI APIs (languageModel/summarizer)
@@ -814,19 +1094,30 @@ async function performAIAnalysis() {
         
         // 2. Deterministic clustering με βάση τα features
         const clusteringStart = nowMs();
+        const debugLog = ENABLE_MERGE_DEBUG_LOGS ? {
+            pairwise: [],
+            smallGroup: [],
+            nameMerges: [],
+            channelMerges: [],
+            stats: {}
+        } : null;
         const featureContext = prepareTabFeatureContext(tabDataForAI);
-        let groups = clusterTabsDeterministic(featureContext);
+        let groups = clusterTabsDeterministic(featureContext, { debugLog });
         logTiming('Feature preparation & clustering', clusteringStart);
         console.log('Deterministic groups created:', groups.map(g => ({
             tabCount: g.tabIndices.length,
             keywords: g.keywords?.slice(0, 6) || []
         })));
         
+        const llmRefinementStart = nowMs();
+        groups = await applyLLMRefinement(groups, featureContext, tabDataForAI);
+        logTiming('LLM refinement', llmRefinementStart);
+        
         // 3. Αντιστοίχιση labels (με AI μόνο για naming)
         const labelingStart = nowMs();
         await assignGroupLabels(groups, tabDataForAI);
         
-        const mergedByName = mergeSimilarNamedGroups(groups, featureContext);
+        const mergedByName = mergeSimilarNamedGroups(groups, featureContext, { debugLog });
         const nameMerged = mergedByName.length !== groups.length;
         if (nameMerged) {
             console.log(`Merged ${groups.length - mergedByName.length} groups based on similar labels.`);
@@ -841,6 +1132,38 @@ async function performAIAnalysis() {
         groups = groups.filter(group => group.tabIndices.length >= 2);
         if (groups.length !== beforeFilterCount) {
             console.log(`Filtered out ${beforeFilterCount - groups.length} single-tab groups from AI results.`);
+        }
+        
+        if (debugLog) {
+            const stats = debugLog.stats || {};
+            const pairComparisons = stats.pairComparisons || 0;
+            const pairUnions = stats.pairUnions || 0;
+            const pairMergeRate = pairComparisons ? Number((pairUnions / pairComparisons).toFixed(3)) : 0;
+            const smallGroupComparisons = stats.smallGroupComparisons || 0;
+            const smallGroupUnions = stats.smallGroupUnions || 0;
+            const nameComparisons = stats.nameComparisons || 0;
+            const nameUnions = stats.nameUnions || 0;
+            const channelUnions = stats.channelUnions || 0;
+            const bridgePairs = (debugLog.pairwise || []).filter(entry => entry.bridge).length;
+            const bridgeRate = pairUnions ? Number((bridgePairs / pairUnions).toFixed(3)) : 0;
+            const purityAvg = groups.length
+                ? Number((groups.reduce((sum, group) => sum + (group.primaryTopicPurity || 0), 0) / groups.length).toFixed(3))
+                : 0;
+            console.log('🧭 Merge diagnostics summary', {
+                pairComparisons,
+                pairUnions,
+                pairMergeRate,
+                smallGroupComparisons,
+                smallGroupUnions,
+                nameComparisons,
+                nameUnions,
+                channelUnions,
+                bridgePairs,
+                bridgeRate,
+                averagePrimaryTopicPurity: purityAvg
+            });
+            featureContext.debugLog = debugLog;
+            lastMergeDebugLog = debugLog;
         }
         
         // 4. Summaries για κάθε group (deferred)
@@ -987,6 +1310,7 @@ async function createTabGroups(aiGroups, tabData) {
             }
         }
         logTiming('Existing group cleanup', cleanupStart);
+        groupActivityState.clear();
         
         // Δημιουργία νέων groups
         console.log('🏗️ Creating groups from AI results...');
@@ -1071,6 +1395,11 @@ async function createTabGroups(aiGroups, tabData) {
                                     const tab = tabData.find(t => t.id === tabId);
                                     console.log(`  📄 Tab ${tabId}: "${tab?.title || 'Unknown'}" (${tab?.domain || 'Unknown domain'})`);
                                 });
+                                
+                                group.chromeGroupId = groupId;
+                                group.autoSuspended = false;
+                                group.lastActive = Date.now();
+                                recordGroupActivity(groupId, { resetSuspension: false });
                             } else {
                                 console.log(`⏭️ Skipping group "${group.name}" - no tabs passed final check`);
                             }
@@ -1087,6 +1416,7 @@ async function createTabGroups(aiGroups, tabData) {
             }
         }
         
+        startAutoSuspendScheduler();
         logTiming('Tab grouping pipeline', groupingStart);
         console.log('Tab groups created successfully');
         
@@ -1354,6 +1684,37 @@ function generateTopicHints(tab) {
             }
         }
         const domainLower = (domain || '').toLowerCase();
+        const features = tab.semanticFeatures || {};
+        
+        if (features.primaryTopic) {
+            const topicLabel = titleCaseFromTokens(tokenizeText(features.primaryTopic)) || features.primaryTopic;
+            hints.add(`Primary topic: ${topicLabel}`);
+        }
+        if (Array.isArray(features.subtopics) && features.subtopics.length) {
+            const topSubtopics = features.subtopics
+                .map(sub => titleCaseFromTokens(tokenizeText(sub)) || sub)
+                .filter(Boolean)
+                .slice(0, 3)
+                .join(', ');
+            if (topSubtopics) {
+                hints.add(`Subtopics: ${topSubtopics}`);
+            }
+        }
+        if (Array.isArray(features.entities) && features.entities.length) {
+            const entitiesList = features.entities.slice(0, 3).join(', ');
+            hints.add(`Entities: ${entitiesList}`);
+        }
+        if (features.docType) {
+            const docLabel = titleCaseFromTokens(tokenizeText(features.docType)) || features.docType;
+            hints.add(`Doc type: ${docLabel}`);
+        }
+        if (Array.isArray(features.mergeHints) && features.mergeHints.length) {
+            const mergePreview = features.mergeHints.slice(0, 4).join(', ');
+            hints.add(`Merge hints: ${mergePreview}`);
+        }
+        if (Array.isArray(tab.summaryBullets) && tab.summaryBullets.length) {
+            hints.add(`AI summary: ${tab.summaryBullets.slice(0, 2).join(' | ')}`);
+        }
         
         if (domainLower.includes('youtube.com') || domainLower.includes('youtu.be')) {
             hints.add('Media: YouTube video');
@@ -1639,7 +2000,12 @@ function buildTabFeatureDescriptor(originalTab, tabEntry) {
         topicHints: originalTab.topicHints || tabEntry.topicHints || '',
         headings: Array.isArray(originalTab.headings) ? originalTab.headings.slice(0, 6) : [],
         metaKeywords: Array.isArray(originalTab.metaKeywords) ? originalTab.metaKeywords.slice(0, 10) : [],
-        language: originalTab.language || '',
+        language: originalTab.language || tabEntry.language || '',
+        sourceLanguage: originalTab.language || tabEntry.language || '',
+        summaryBullets: Array.isArray(originalTab.summaryBullets)
+            ? originalTab.summaryBullets.slice(0, 6)
+            : [],
+        classification: originalTab.classification || null,
         youtube: {
             topic: youtube.topic || '',
             tags: youtube.tags || [],
@@ -1661,15 +2027,121 @@ function fallbackTabFeatures(originalTab, tabEntry) {
         originalTab.youtubeAnalysis?.description || '',
         (originalTab.youtubeAnalysis?.summaryBullets || []).join(' ')
     ].join(' ');
-    const keywords = extractMeaningfulKeywords(combinedText).slice(0, 6);
-    let topic = originalTab.youtubeAnalysis?.topic || tabEntry.domain || originalTab.title || 'General browsing';
-    if (topic.length > 40 && keywords.length >= 3) {
-        topic = keywords.slice(0, 3).join(' ');
+    const normalizedKeywords = extractMeaningfulKeywords(combinedText).slice(0, 6);
+    const lowerKeywords = normalizedKeywords.map(keyword => keyword.toLowerCase());
+    const titleTokens = tokenizeText(originalTab.title || '').slice(0, 4);
+    
+    const topicBaseTokens = lowerKeywords.length ? lowerKeywords.slice(0, 3) : titleTokens.slice(0, 3);
+    const domainTokens = tokenizeText(tabEntry.domain || '').slice(0, 3);
+    const mergedTokens = Array.from(new Set([...topicBaseTokens, ...domainTokens])).filter(Boolean);
+    
+    let primaryTopic = mergedTokens.slice(0, 3).join(' ');
+    if (!primaryTopic) {
+        primaryTopic = (tabEntry.domain || 'general').split('.').filter(Boolean).slice(-2, -1)[0] || 'general';
     }
+    primaryTopic = primaryTopic.trim() || 'general';
+    
+    const mergeHintSource = Array.from(new Set([
+        ...lowerKeywords,
+        ...topicBaseTokens,
+        ...domainTokens
+    ])).filter(token => token.length >= 3 && !GENERIC_MERGE_STOPWORDS.has(token));
+    let mergeHints = mergeHintSource.slice(0, 6);
+    if (mergeHints.length < 2) {
+        const fallbackTokens = tokenizeText(primaryTopic)
+            .filter(token => !GENERIC_MERGE_STOPWORDS.has(token))
+            .slice(0, 3);
+        mergeHints = Array.from(new Set([...mergeHints, ...fallbackTokens]))
+            .filter(Boolean)
+            .slice(0, 6);
+    }
+    if (mergeHints.length < 2) {
+        mergeHints = ['misc', 'browsing'];
+    }
+    
+    const summaryBullets = [];
+    const metaSnippet = (originalTab.metaDescription || '').trim();
+    if (metaSnippet) {
+        summaryBullets.push(metaSnippet.slice(0, 220));
+    }
+    if (Array.isArray(originalTab.headings) && originalTab.headings.length) {
+        summaryBullets.push(String(originalTab.headings[0]).trim().slice(0, 180));
+    }
+    if (!summaryBullets.length && originalTab.content) {
+        summaryBullets.push(originalTab.content.slice(0, 200));
+    }
+    
+    const urlString = originalTab.url || tabEntry.url || '';
+    let docType = 'article';
+    let isGenericLanding = false;
+    try {
+        const url = new URL(urlString);
+        const path = (url.pathname || '').toLowerCase();
+        const segments = path.split('/').filter(Boolean);
+        const hasShortPath = segments.length <= 1;
+        const pathIndicators = ['category', 'topics', 'tag', 'tags', 'collections'];
+        const portalIndicators = ['portal', 'hub', 'overview'];
+        const docsIndicators = ['docs', 'documentation', 'developer', 'api', 'guide'];
+        
+        if (!combinedText.trim() || hasShortPath) {
+            docType = 'landing';
+            isGenericLanding = true;
+        } else if (pathIndicators.some(token => path.includes(token))) {
+            docType = 'category';
+            isGenericLanding = true;
+        } else if (portalIndicators.some(token => path.includes(token))) {
+            docType = 'portal';
+            isGenericLanding = true;
+        } else if (docsIndicators.some(token => path.includes(token)) || url.hostname.startsWith('docs.')) {
+            docType = 'docs';
+        } else if (segments.length === 0) {
+            docType = 'landing';
+            isGenericLanding = true;
+        }
+    } catch (error) {
+        docType = 'landing';
+        isGenericLanding = !combinedText.trim();
+    }
+    
+    const entities = [];
+    try {
+        const host = new URL(urlString).hostname;
+        const parts = host.split('.').filter(part => part && part !== 'www');
+        const entity = parts.slice(-2, -1)[0] || parts[0];
+        if (entity) {
+            entities.push(entity.charAt(0).toUpperCase() + entity.slice(1));
+        }
+    } catch (_) {
+        if (tabEntry.domain) {
+            const parts = tabEntry.domain.split('.').filter(part => part && part !== 'www');
+            const entity = parts.slice(-2, -1)[0] || parts[0];
+            if (entity) {
+                entities.push(entity.charAt(0).toUpperCase() + entity.slice(1));
+            }
+        }
+    }
+    
+    const topicTitle = titleCaseFromTokens(tokenizeText(primaryTopic));
+    const subtopics = lowerKeywords.slice(0, 4);
+    const summaryKeywords = Array.from(new Set(summaryBullets.flatMap(bullet => tokenizeText(bullet))))
+        .filter(token => token && !GENERIC_MERGE_STOPWORDS.has(token))
+        .slice(0, 6);
+    
     return {
-        topic: topic.trim() || 'General browsing',
-        keywords: keywords.length ? keywords : (topic.split(/\s+/).slice(0, 3).map(word => word.toLowerCase())),
-        origin: 'fallback'
+        topic: topicTitle || 'General browsing',
+        keywords: mergeHints,
+        origin: 'fallback',
+        primaryTopic,
+        subtopics,
+        entities,
+        docType,
+        isGenericLanding,
+        mergeHints,
+        summaryBullets,
+        summaryKeywords,
+        version: 2,
+        sourceLanguage: originalTab.sourceLanguage || tabEntry.language || DEFAULT_WORKING_LANGUAGE,
+        normalizedLanguage: DEFAULT_WORKING_LANGUAGE
     };
 }
 
@@ -1716,10 +2188,82 @@ async function ensureTabSemanticFeatures(tabDataForAI) {
         return entry.url;
     };
     
-    const processEntry = async (entry) => {
+    const sanitizeStringList = (list, { limit = 6, toLower = true, minLength = 2, banned = [] } = {}) => {
+        if (!Array.isArray(list)) return [];
+        const bannedSet = new Set(banned.map(item => item.toLowerCase()));
+        const result = [];
+        for (const item of list) {
+            if (item === null || item === undefined) continue;
+            let token = String(item).trim();
+            if (!token) continue;
+            if (toLower) token = token.toLowerCase();
+            if (token.length < minLength) continue;
+            if (bannedSet.has(token)) continue;
+            if (!result.includes(token)) {
+                result.push(token);
+            }
+            if (result.length >= limit) break;
+        }
+        return result;
+    };
+    
+    const applyFeaturesToTab = (entry, originalTab, features) => {
+        if (!features) {
+            return;
+        }
+        const summaryBullets = Array.isArray(features.summaryBullets)
+            ? features.summaryBullets.slice(0, 6)
+            : [];
+        const classification = {
+            primaryTopic: features.primaryTopic || features.topic || '',
+            subtopics: Array.isArray(features.subtopics) ? features.subtopics.slice(0, 6) : [],
+            entities: Array.isArray(features.entities) ? features.entities.slice(0, 6) : [],
+            docType: features.docType || 'article',
+            isGenericLanding: Boolean(features.isGenericLanding),
+            mergeHints: Array.isArray(features.mergeHints)
+                ? features.mergeHints.slice(0, 8)
+                : (Array.isArray(features.keywords) ? features.keywords.slice(0, 8) : [])
+        };
+        
+        entry.semanticFeatures = { ...features };
+        originalTab.semanticFeatures = { ...features };
+        entry.summaryBullets = summaryBullets;
+        originalTab.summaryBullets = summaryBullets;
+        entry.classification = { ...classification };
+        originalTab.classification = { ...classification };
+        if (features.sourceLanguage) {
+            entry.sourceLanguage = features.sourceLanguage;
+            originalTab.sourceLanguage = features.sourceLanguage;
+        }
+        if (features.normalizedLanguage) {
+            entry.language = features.normalizedLanguage;
+            originalTab.language = features.normalizedLanguage;
+        }
+        originalTab.topicHints = generateTopicHints(originalTab);
+        entry.topicHints = originalTab.topicHints;
+    };
+    
+    const processEntry = async (entry, attempt = 0) => {
         const originalTab = currentTabData[entry.index];
-        if (originalTab.semanticFeatures && originalTab.semanticFeatures.topic && originalTab.semanticFeatures.keywords?.length) {
-            entry.semanticFeatures = { ...originalTab.semanticFeatures };
+        if (!originalTab) {
+            return;
+        }
+        const resolvedLanguage = await ensureEntryLanguage({
+            language: entry.language || originalTab.language,
+            detectedLanguage: entry.detectedLanguage,
+            fullContent: originalTab.content || entry.fullContent,
+            content: entry.content,
+            metaDescription: entry.metaDescription || originalTab.metaDescription,
+            headings: entry.headings || originalTab.headings,
+            title: entry.title || originalTab.title
+        });
+        entry.language = resolvedLanguage;
+        originalTab.language = resolvedLanguage;
+        entry.sourceLanguage = resolvedLanguage;
+        originalTab.sourceLanguage = resolvedLanguage;
+        
+        if (originalTab.semanticFeatures?.version >= 2) {
+            applyFeaturesToTab(entry, originalTab, originalTab.semanticFeatures);
             return;
         }
         
@@ -1729,11 +2273,9 @@ async function ensureTabSemanticFeatures(tabDataForAI) {
             const hashesMatch = cached?.contentHash && entry.contentHash
                 ? cached.contentHash === entry.contentHash
                 : Boolean(cached?.contentHash) === Boolean(entry.contentHash);
-            if (cached && cached.features && hashesMatch && (Date.now() - cached.timestamp) < 10 * 60 * 1000) {
-                originalTab.semanticFeatures = cached.features;
-                entry.semanticFeatures = cached.features;
-                originalTab.topicHints = generateTopicHints(originalTab);
-                entry.topicHints = originalTab.topicHints;
+            const versionOk = cached?.features?.version >= 2;
+            if (cached && cached.features && hashesMatch && versionOk && (Date.now() - cached.timestamp) < 10 * 60 * 1000) {
+                applyFeaturesToTab(entry, originalTab, cached.features);
                 return;
             }
         }
@@ -1754,17 +2296,83 @@ async function ensureTabSemanticFeatures(tabDataForAI) {
                     func: generateTabFeaturesInPage,
                     args: [descriptor]
                 });
-                const results = await withTimeout(scriptPromise, AI_FEATURE_TIMEOUT, 'AI feature timeout');
+                const timeoutBudget = attempt === 0
+                    ? AI_FEATURE_TIMEOUT
+                    : Math.min(AI_FEATURE_TIMEOUT * 1.5, AI_FEATURE_TIMEOUT + 6000);
+                const results = await withTimeout(scriptPromise, timeoutBudget, 'AI feature timeout');
                 
                 if (results && results[0] && results[0].result) {
                     const resultPayload = results[0].result;
                     if (resultPayload.ok) {
                         aiRequestCount += 1;
+                        const bannedMergeWords = Array.from(GENERIC_MERGE_STOPWORDS);
+                        const primaryTopicRaw = String(resultPayload.primaryTopic || resultPayload.topic || '').trim();
+                        const topicTokens = tokenizeText(primaryTopicRaw);
+                        const topicLabel = resultPayload.topicLabel ||
+                            titleCaseFromTokens(topicTokens.slice(0, 4)) ||
+                            (descriptor.title ? descriptor.title.split(/\s+/).slice(0, 3).join(' ') : 'General browsing');
+                        const mergeHints = sanitizeStringList(resultPayload.mergeHints || resultPayload.keywords || [], {
+                            limit: 6,
+                            toLower: true,
+                            minLength: 3,
+                            banned: bannedMergeWords
+                        });
+                        const summaryBullets = Array.isArray(resultPayload.summary)
+                            ? resultPayload.summary.slice(0, 6)
+                            : [];
+                        const summaryKeywordHints = sanitizeStringList(
+                            summaryBullets.flatMap(bullet => tokenizeText(bullet)),
+                            {
+                                limit: 6,
+                                toLower: true,
+                                minLength: 3,
+                                banned: bannedMergeWords
+                            }
+                        );
+                        let ensuredMergeHints = mergeHints.length
+                            ? mergeHints
+                            : sanitizeStringList(topicTokens, { limit: 6, toLower: true, minLength: 3 });
+                        if (summaryKeywordHints.length) {
+                            const mergedHints = new Set([...ensuredMergeHints, ...summaryKeywordHints]);
+                            ensuredMergeHints = Array.from(mergedHints).slice(0, 6);
+                        }
+                        const subtopics = sanitizeStringList(resultPayload.subtopics || [], {
+                            limit: 6,
+                            toLower: true,
+                            minLength: 3
+                        });
+                        const entities = sanitizeStringList(resultPayload.entities || [], {
+                            limit: 6,
+                            toLower: false,
+                            minLength: 2
+                        });
+                        const primaryTopic = (primaryTopicRaw || topicLabel || 'general').toLowerCase();
+                        const docType = String(resultPayload.docType || 'article').toLowerCase();
+                        const isGenericLanding = Boolean(resultPayload.isGenericLanding);
+                        
                         features = {
-                            topic: resultPayload.topic,
-                            keywords: resultPayload.keywords,
-                            origin: 'ai'
+                            topic: topicLabel,
+                            keywords: ensuredMergeHints,
+                            origin: 'ai',
+                            primaryTopic,
+                            subtopics,
+                            entities,
+                            docType,
+                            isGenericLanding,
+                            mergeHints: ensuredMergeHints,
+                            summaryBullets: summaryBullets.length ? summaryBullets : (descriptor.summaryBullets || []),
+                            summaryKeywords: summaryKeywordHints,
+                            version: 2,
+                            sourceLanguage: resultPayload.sourceLanguage || resolvedLanguage,
+                            normalizedLanguage: resultPayload.normalizedLanguage || DEFAULT_WORKING_LANGUAGE
                         };
+                        entry.language = features.normalizedLanguage;
+                        originalTab.language = features.normalizedLanguage;
+                        entry.sourceLanguage = features.sourceLanguage;
+                        originalTab.sourceLanguage = features.sourceLanguage;
+                        if (!features.summaryBullets.length && descriptor.metaDescription) {
+                            features.summaryBullets = [descriptor.metaDescription.slice(0, 200)];
+                        }
                     } else {
                         const reason = resultPayload.error;
                         const status = resultPayload.status;
@@ -1780,8 +2388,12 @@ async function ensureTabSemanticFeatures(tabDataForAI) {
             } catch (error) {
                 if (error?.message === 'AI feature timeout') {
                     failureReasons.add('Language model timeout (features)');
-                    aiTabId = null;
-                    console.warn('generateTabFeaturesInPage timed out, falling back to heuristic features.');
+                    if (attempt < 1) {
+                        console.warn('generateTabFeaturesInPage timed out, retrying with extended timeout...');
+                        await processEntry(entry, attempt + 1);
+                        return;
+                    }
+                    console.warn('generateTabFeaturesInPage timed out after retry, falling back to heuristics.');
                 } else {
                     failureReasons.add(error?.message || String(error));
                 }
@@ -1789,14 +2401,23 @@ async function ensureTabSemanticFeatures(tabDataForAI) {
         }
         
         if (!features) {
+            const reason = failureReasons.size
+                ? Array.from(failureReasons).slice(0, 3).join(' | ')
+                : 'unknown AI feature failure';
+            console.error('AI semantic feature generation failed for tab:', {
+                url: entry.url,
+                title: entry.title,
+                reasons: Array.from(failureReasons),
+                attempt
+            });
+            if (ENFORCE_AI_FEATURES) {
+                throw new Error(`AI semantic feature generation failed: ${reason}`);
+            }
             features = fallbackTabFeatures(originalTab, entry);
             fallbackCount += 1;
         }
         
-        originalTab.semanticFeatures = features;
-        entry.semanticFeatures = features;
-        originalTab.topicHints = generateTopicHints(originalTab);
-        entry.topicHints = originalTab.topicHints;
+        applyFeaturesToTab(entry, originalTab, features);
         if (cacheKey && features) {
             cacheUpdates[cacheKey] = {
                 timestamp: Date.now(),
@@ -1807,21 +2428,14 @@ async function ensureTabSemanticFeatures(tabDataForAI) {
             };
     
     if (!aiTabId) {
-        await Promise.all(tabDataForAI.map(processEntry));
+        await Promise.all(tabDataForAI.map(entry => processEntry(entry)));
     } else {
-        const concurrency = Math.min(4, Math.max(1, tabDataForAI.length));
-        let cursor = 0;
-        const workers = Array.from({ length: concurrency }, () => (async () => {
-            while (true) {
-                const index = cursor++;
-                if (index >= tabDataForAI.length) break;
-                await processEntry(tabDataForAI[index]);
-            }
-        })());
-        await Promise.all(workers);
+        for (const entry of tabDataForAI) {
+            await processEntry(entry);
+        }
     }
     
-    if (fallbackCount > 0) {
+    if (fallbackCount > 0 && !ENFORCE_AI_FEATURES) {
         const reasonsSummary = failureReasons.size
             ? ` Reasons: ${Array.from(failureReasons).slice(0, 3).join(' | ')}`
             : '';
@@ -1967,6 +2581,17 @@ async function ensureTabEmbeddings(tabDataForAI) {
         }
         
         if (!embeddingVector) {
+            const reason = failureReasons.size
+                ? Array.from(failureReasons).slice(0, 3).join(' | ')
+                : 'unknown embedding failure';
+            console.error('AI embedding generation failed for tab:', {
+                url: entry.url,
+                title: entry.title,
+                reasons: Array.from(failureReasons)
+            });
+            if (ENFORCE_AI_FEATURES) {
+                throw new Error(`AI embedding generation failed: ${reason}`);
+            }
             embeddingVector = computeFallbackEmbedding(entry);
             fallbackCount += 1;
         }
@@ -1992,7 +2617,7 @@ async function ensureTabEmbeddings(tabDataForAI) {
         await Promise.all(tabDataForAI.map(processEntry));
     }
     
-    if (fallbackCount > 0) {
+    if (fallbackCount > 0 && !ENFORCE_AI_FEATURES) {
         const reasonsSummary = failureReasons.size
             ? ` Reasons: ${Array.from(failureReasons).slice(0, 3).join(' | ')}`
             : '';
@@ -2015,6 +2640,52 @@ function tokenizeText(value) {
         .filter(token => token.length >= 3 && !STOPWORDS.has(token));
 }
 
+function computeSimHash(tokens) {
+    if (!tokens) {
+        return null;
+    }
+    const iterable = tokens instanceof Set ? tokens : new Set(tokens);
+    if (!iterable.size) {
+        return null;
+    }
+    const weights = new Array(SIMHASH_BITS).fill(0);
+    let total = 0;
+    iterable.forEach(token => {
+        if (!token) return;
+        const hash = positiveHash(token);
+        total += 1;
+        for (let bit = 0; bit < SIMHASH_BITS; bit += 1) {
+            const mask = 1 << (bit % 32);
+            const contribution = (hash & mask) ? 1 : -1;
+            weights[bit] += contribution;
+        }
+    });
+    if (!total) {
+        return null;
+    }
+    let result = 0n;
+    for (let bit = 0; bit < SIMHASH_BITS; bit += 1) {
+        if (weights[bit] >= 0) {
+            result |= (1n << BigInt(bit));
+        }
+    }
+    return result;
+}
+
+function simHashSimilarity(hashA, hashB) {
+    if (typeof hashA !== 'bigint' || typeof hashB !== 'bigint') {
+        return 0;
+    }
+    let diff = hashA ^ hashB;
+    let distance = 0;
+    while (diff) {
+        distance += Number(diff & 1n);
+        diff >>= 1n;
+    }
+    const normalized = 1 - (distance / SIMHASH_BITS);
+    return normalized < 0 ? 0 : normalized;
+}
+
 function extractUrlPathTokens(url) {
     if (!url) return [];
     try {
@@ -2026,6 +2697,194 @@ function extractUrlPathTokens(url) {
             .filter(token => token.length >= 3 && !/^\d+$/.test(token) && !STOPWORDS.has(token));
     } catch (error) {
         return [];
+    }
+}
+
+function buildTabLLMProfile(tabEntry) {
+    if (!tabEntry) {
+        return {
+            title: '',
+            url: '',
+            domain: '',
+            meta: '',
+            content: '',
+            language: 'en',
+            docType: '',
+            mergeHints: [],
+            entities: [],
+            subtopics: [],
+            summaryBullets: []
+        };
+    }
+    const semantic = tabEntry.semanticFeatures || {};
+    const language = (semantic.language || tabEntry.language || (typeof navigator !== 'undefined' ? navigator.language : '') || 'en')
+        .toString()
+        .split('-')[0] || 'en';
+    return {
+        title: tabEntry.title || '',
+        url: tabEntry.url || '',
+        domain: tabEntry.domain || '',
+        meta: (tabEntry.metaDescription || '').slice(0, 240),
+        content: (tabEntry.content || tabEntry.fullContent || '')
+            .replace(/\s+/g, ' ')
+            .slice(0, 600),
+        language,
+        docType: semantic.docType || '',
+        mergeHints: Array.isArray(semantic.mergeHints) ? semantic.mergeHints.slice(0, 8) : [],
+        entities: Array.isArray(semantic.entities) ? semantic.entities.slice(0, 6) : [],
+        subtopics: Array.isArray(semantic.subtopics) ? semantic.subtopics.slice(0, 6) : [],
+        summaryBullets: Array.isArray(tabEntry.summaryBullets) ? tabEntry.summaryBullets.slice(0, 4) : []
+    };
+}
+
+async function verifyTabPairWithLM(tabA, tabB) {
+    if (!tabA || !tabB) {
+        throw new Error('Invalid tab data for LM verification');
+    }
+    const keyParts = [tabA.url || String(tabA.index), tabB.url || String(tabB.index)].sort();
+    const cacheKey = keyParts.join('||');
+    if (PAIRWISE_LLM_CACHE.has(cacheKey)) {
+        return PAIRWISE_LLM_CACHE.get(cacheKey);
+    }
+    
+    const accessibleTab = await findUsableAIAccessTab();
+    if (!accessibleTab) {
+        throw new Error('No accessible tab available for LM verification');
+    }
+    
+    const profileA = buildTabLLMProfile(tabA);
+    const profileB = buildTabLLMProfile(tabB);
+    const language = profileA.language || profileB.language || 'en';
+    
+    const args = [{
+        language,
+        tabs: [
+            profileA,
+            profileB
+        ]
+    }];
+    
+    const results = await withTimeout(
+        chrome.scripting.executeScript({
+            target: { tabId: accessibleTab.id },
+            world: 'MAIN',
+            func: judgeTabSimilarityInPage,
+            args
+        }),
+        LLM_VERIFICATION_TIMEOUT,
+        'LLM verification timeout'
+    );
+    
+    const payload = results && results[0] && results[0].result;
+    if (!payload || !payload.ok) {
+        const reason = payload?.error || 'Unknown LLM verification error';
+        throw new Error(reason);
+    }
+    
+    PAIRWISE_LLM_CACHE.set(cacheKey, payload);
+    return payload;
+}
+
+async function applyLLMRefinement(groups, featureContext, tabDataForAI) {
+    if (!Array.isArray(groups) || groups.length === 0) {
+        return groups;
+    }
+    if (!featureContext || !Array.isArray(featureContext.vectors) || !featureContext.vectors.length) {
+        return groups;
+    }
+    try {
+        const vectors = featureContext.vectors;
+        const similarityCache = featureContext.similarityCache || new Map();
+        const vectorSets = groups.map(group => new Set(group.vectorIndices || []));
+        const tabSets = groups.map(group => new Set(group.tabIndices || []));
+        const removedGroups = new Set();
+        let mergePerformed = false;
+        
+        const singletons = groups
+            .map((group, index) => ({ group, index }))
+            .filter(entry => (entry.group.tabIndices?.length || 0) === 1);
+        
+        for (const entry of singletons) {
+            const { group, index } = entry;
+            if (removedGroups.has(index)) continue;
+            const vectorIdx = group.vectorIndices?.[0];
+            const tabIdx = group.tabIndices?.[0];
+            if (typeof vectorIdx !== 'number' || typeof tabIdx !== 'number') continue;
+            
+            let bestScore = 0;
+            let bestGroupIndex = -1;
+            let bestVectorMatch = null;
+            
+            for (let targetIndex = 0; targetIndex < groups.length; targetIndex += 1) {
+                if (targetIndex === index || removedGroups.has(targetIndex)) continue;
+                const targetGroup = groups[targetIndex];
+                if (!targetGroup?.vectorIndices?.length) continue;
+                
+                for (const targetVectorIdx of targetGroup.vectorIndices) {
+                    const key = vectorIdx < targetVectorIdx ? `${vectorIdx}|${targetVectorIdx}` : `${targetVectorIdx}|${vectorIdx}`;
+                    let score = similarityCache.get(key);
+                    if (typeof score !== 'number') {
+                        score = computeWeightedSimilarity(vectors[vectorIdx], vectors[targetVectorIdx]);
+                        similarityCache.set(key, score);
+                    }
+                    if (score > bestScore) {
+                        bestScore = score;
+                        bestGroupIndex = targetIndex;
+                        bestVectorMatch = targetVectorIdx;
+                    }
+                }
+            }
+            
+            if (bestGroupIndex === -1 || bestScore < LLM_MERGE_SIMILARITY_FLOOR) {
+                continue;
+            }
+            
+            const tabA = tabDataForAI[tabIdx];
+            const targetTabIdx = groups[bestGroupIndex].tabIndices?.[0];
+            const tabB = typeof targetTabIdx === 'number' ? tabDataForAI[targetTabIdx] : null;
+            if (!tabA || !tabB) {
+                continue;
+            }
+            
+            try {
+                const verification = await verifyTabPairWithLM(tabA, tabB);
+                if (verification.sameTopic && verification.confidence >= LLM_VERIFICATION_CONFIDENCE) {
+                    vectorSets[bestGroupIndex].add(vectorIdx);
+                    tabSets[bestGroupIndex].add(tabIdx);
+                    removedGroups.add(index);
+                    mergePerformed = true;
+                    console.log('LLM refinement merged singleton tab into group:', {
+                        singletonTab: tabA.url,
+                        targetGroup: groups[bestGroupIndex].name || bestGroupIndex,
+                        confidence: verification.confidence,
+                        reason: verification.reason
+                    });
+                }
+            } catch (verificationError) {
+                console.warn('LLM verification skipped for tab pair:', verificationError.message || verificationError);
+            }
+        }
+        
+        if (!mergePerformed) {
+            return groups;
+        }
+        
+        const refinedGroups = [];
+        for (let idx = 0; idx < groups.length; idx += 1) {
+            if (removedGroups.has(idx)) {
+                continue;
+            }
+            const vectorList = Array.from(vectorSets[idx]).sort((a, b) => a - b);
+            if (!vectorList.length) {
+                continue;
+            }
+            const enriched = enrichGroupFromVectors(vectorList, vectors, similarityCache);
+            refinedGroups.push(enriched);
+        }
+        return refinedGroups;
+    } catch (error) {
+        console.warn('LLM refinement skipped due to error:', error);
+        return groups;
     }
 }
 
@@ -2129,36 +2988,108 @@ function prepareTabFeatureContext(tabDataForAI) {
     const vectors = tabDataForAI.map(entry => {
         const features = entry.semanticFeatures || {};
         const keywordTokens = new Set();
-        const semanticTopicTokens = new Set(tokenizeText(features.topic));
+        const semanticTopicTokens = new Set();
+        const topicSources = [
+            features.topic,
+            features.primaryTopic,
+            ...(Array.isArray(features.subtopics) ? features.subtopics : [])
+        ];
+        topicSources.forEach(source => {
+            tokenizeText(source).forEach(token => {
+                if (GENERIC_MERGE_STOPWORDS.has(token)) return;
+                semanticTopicTokens.add(token);
+            });
+        });
+        if (features.docType) {
+            const docToken = String(features.docType).toLowerCase();
+            if (docToken.length >= 3 && !STOPWORDS.has(docToken) && !GENERIC_MERGE_STOPWORDS.has(docToken)) {
+                semanticTopicTokens.add(docToken);
+            }
+        }
         semanticTopicTokens.forEach(token => keywordTokens.add(token));
-        (features.keywords || []).forEach(keyword => {
+        
+        const mergeHintTokens = Array.isArray(features.mergeHints)
+            ? features.mergeHints.slice()
+            : (Array.isArray(features.keywords) ? features.keywords.slice() : []);
+        if (Array.isArray(features.summaryKeywords) && features.summaryKeywords.length) {
+            features.summaryKeywords.forEach(keyword => {
+                mergeHintTokens.push(keyword);
+            });
+        }
+        mergeHintTokens.forEach(keyword => {
             const token = String(keyword || '').toLowerCase().trim();
-            if (token.length >= 3 && !STOPWORDS.has(token)) {
+            if (token.length >= 3 && !STOPWORDS.has(token) && !GENERIC_MERGE_STOPWORDS.has(token)) {
                 keywordTokens.add(token);
             }
         });
+        (features.subtopics || []).forEach(subtopic => {
+            tokenizeText(subtopic).forEach(token => {
+                if (GENERIC_MERGE_STOPWORDS.has(token)) return;
+                keywordTokens.add(token);
+            });
+        });
+        const entityTokens = new Set();
+        const entitySources = [
+            ...(Array.isArray(features.entities) ? features.entities : []),
+            ...(Array.isArray(entry.classification?.entities) ? entry.classification.entities : [])
+        ];
+        entitySources.forEach(entity => {
+            tokenizeText(entity).forEach(token => {
+                if (GENERIC_MERGE_STOPWORDS.has(token)) return;
+                entityTokens.add(token);
+                keywordTokens.add(token);
+            });
+        });
+        (entry.summaryBullets || []).forEach(bullet => {
+            tokenizeText(bullet).forEach(token => {
+                if (GENERIC_MERGE_STOPWORDS.has(token)) return;
+                keywordTokens.add(token);
+            });
+        });
+        
+        entry.docType = features.docType || entry.docType || '';
+        entry.isGenericLanding = typeof features.isGenericLanding === 'boolean'
+            ? features.isGenericLanding
+            : (entry.isGenericLanding || false);
+        entry.primaryTopic = features.primaryTopic || entry.primaryTopic || '';
+        entry.mergeHints = Array.isArray(features.mergeHints)
+            ? features.mergeHints.filter(token => !GENERIC_MERGE_STOPWORDS.has(String(token || '').toLowerCase().trim()))
+            : (Array.isArray(features.keywords) ? features.keywords.filter(token => !GENERIC_MERGE_STOPWORDS.has(String(token || '').toLowerCase().trim())) : []);
+        entry.entityTokens = Array.from(entityTokens);
         
         (entry.metaKeywords || []).forEach(keyword => {
-            tokenizeText(keyword).forEach(token => keywordTokens.add(token));
+            tokenizeText(keyword).forEach(token => {
+                if (GENERIC_MERGE_STOPWORDS.has(token)) return;
+                keywordTokens.add(token);
+            });
         });
         (entry.headings || []).forEach(heading => {
-            tokenizeText(heading).forEach(token => keywordTokens.add(token));
+            tokenizeText(heading).forEach(token => {
+                if (GENERIC_MERGE_STOPWORDS.has(token)) return;
+                keywordTokens.add(token);
+            });
         });
-        tokenizeText(entry.topicHints).forEach(token => keywordTokens.add(token));
-        tokenizeText(entry.youtubeTopic).forEach(token => keywordTokens.add(token));
+        tokenizeText(entry.topicHints).forEach(token => {
+            if (GENERIC_MERGE_STOPWORDS.has(token)) return;
+            keywordTokens.add(token);
+        });
+        tokenizeText(entry.youtubeTopic).forEach(token => {
+            if (GENERIC_MERGE_STOPWORDS.has(token)) return;
+            keywordTokens.add(token);
+        });
         (entry.youtubeTags || [])
             .map(tag => String(tag || '').toLowerCase().trim())
-            .filter(Boolean)
+            .filter(tag => tag && !GENERIC_MERGE_STOPWORDS.has(tag) && !STOPWORDS.has(tag))
             .forEach(tag => keywordTokens.add(tag));
         
         const taxonomyArray = inferTaxonomyTags(entry);
-        const taxonomyTags = new Set();
-        taxonomyArray.forEach(tag => {
-            const token = String(tag || '').toLowerCase().trim();
-            if (!token || STOPWORDS.has(token)) return;
-            taxonomyTags.add(token);
-            keywordTokens.add(token);
-        });
+    const taxonomyTags = new Set();
+    taxonomyArray.forEach(tag => {
+        const token = String(tag || '').toLowerCase().trim();
+        if (!token || STOPWORDS.has(token) || GENERIC_MERGE_STOPWORDS.has(token)) return;
+        taxonomyTags.add(token);
+        keywordTokens.add(token);
+    });
         entry.taxonomyTags = taxonomyArray;
         
         const titleTokens = new Set(tokenizeText(entry.title));
@@ -2180,12 +3111,18 @@ function prepareTabFeatureContext(tabDataForAI) {
         const tfTokens = [
             ...tokenizeText(entry.fullContent ? entry.fullContent.slice(0, 2000) : ''),
             ...tokenizeText(entry.topicHints),
-            ...Array.from(titleTokens),
-            ...Array.from(pathTokens),
-            ...(entry.youtubeTags || []).map(tag => String(tag || '').toLowerCase().trim()).filter(Boolean),
-            ...(entry.metaKeywords || []).flatMap(keyword => tokenizeText(keyword)),
-            ...(entry.headings || []).flatMap(heading => tokenizeText(heading)),
-            ...taxonomyArray.map(tag => String(tag || '').toLowerCase()).flatMap(tokenizeText)
+            ...tokenizeText(features.primaryTopic),
+            ...(Array.isArray(features.subtopics) ? features.subtopics.flatMap(sub => tokenizeText(sub)).filter(token => !GENERIC_MERGE_STOPWORDS.has(token)) : []),
+            ...(Array.isArray(mergeHintTokens) ? mergeHintTokens.flatMap(token => tokenizeText(token)).filter(token => !GENERIC_MERGE_STOPWORDS.has(token)) : []),
+            ...entitySources.flatMap(entity => tokenizeText(entity)).filter(token => !GENERIC_MERGE_STOPWORDS.has(token)),
+            ...tokenizeText(features.docType).filter(token => !GENERIC_MERGE_STOPWORDS.has(token)),
+            ...(Array.isArray(entry.summaryBullets) ? entry.summaryBullets.flatMap(bullet => tokenizeText(bullet)).filter(token => !GENERIC_MERGE_STOPWORDS.has(token)) : []),
+            ...Array.from(titleTokens).filter(token => !GENERIC_MERGE_STOPWORDS.has(token)),
+            ...Array.from(pathTokens).filter(token => !GENERIC_MERGE_STOPWORDS.has(token)),
+            ...(entry.youtubeTags || []).map(tag => String(tag || '').toLowerCase().trim()).filter(tag => tag && !GENERIC_MERGE_STOPWORDS.has(tag) && !STOPWORDS.has(tag)),
+            ...(entry.metaKeywords || []).flatMap(keyword => tokenizeText(keyword)).filter(token => !GENERIC_MERGE_STOPWORDS.has(token)),
+            ...(entry.headings || []).flatMap(heading => tokenizeText(heading)).filter(token => !GENERIC_MERGE_STOPWORDS.has(token)),
+            ...taxonomyArray.map(tag => String(tag || '').toLowerCase()).flatMap(tokenizeText).filter(token => !GENERIC_MERGE_STOPWORDS.has(token))
         ].slice(0, 1200);
         
         tfTokens.forEach(token => {
@@ -2201,6 +3138,8 @@ function prepareTabFeatureContext(tabDataForAI) {
             entry.semanticEmbedding = embeddingVector.slice();
         }
         
+        const simHash = computeSimHash(keywordTokens);
+        
         return {
             index: entry.index,
             keywordTokens,
@@ -2212,9 +3151,15 @@ function prepareTabFeatureContext(tabDataForAI) {
             taxonomyTags,
             language: entry.language || '',
             youtubeTopic: entry.youtubeTopic || '',
+            primaryTopic: entry.primaryTopic || '',
+            docType: entry.docType || '',
+            isGenericLanding: Boolean(entry.isGenericLanding),
+            mergeHints: Array.isArray(entry.mergeHints) ? entry.mergeHints.slice() : [],
+            entities: entityTokens,
             tfCounts,
             totalTokenCount,
             embeddingVector,
+            simHash,
             tabData: entry
         };
     });
@@ -2239,7 +3184,7 @@ function prepareTabFeatureContext(tabDataForAI) {
     return { vectors, tabData: tabDataForAI };
 }
 
-function computeWeightedSimilarity(vectorA, vectorB) {
+function computeWeightedSimilarity(vectorA, vectorB, debugOut = null) {
     const S_kw = jaccardSimilarity(vectorA.keywordTokens, vectorB.keywordTokens);
     const S_topic = jaccardSimilarity(vectorA.semanticTopicTokens, vectorB.semanticTopicTokens);
     const S_title = jaccardSimilarity(vectorA.titleTokens, vectorB.titleTokens);
@@ -2249,27 +3194,103 @@ function computeWeightedSimilarity(vectorA, vectorB) {
     const S_domTokens = jaccardSimilarity(vectorA.domainTokens, vectorB.domainTokens);
     const S_lang = vectorA.language && vectorA.language === vectorB.language ? 1 : 0;
     const S_embed = cosineSimilarityArray(vectorA.embeddingVector, vectorB.embeddingVector);
+    const S_sim = simHashSimilarity(vectorA.simHash, vectorB.simHash);
     const S_tax = normalizedOverlap(vectorA.taxonomyTags, vectorB.taxonomyTags);
     const langPenalty = (!vectorA.language || !vectorB.language || vectorA.language === vectorB.language) ? 1 : 0.85;
+    const mergeSetA = new Set(
+        (vectorA.mergeHints || [])
+            .map(token => String(token || '').toLowerCase().trim())
+            .filter(token => token.length >= 3 && !STOPWORDS.has(token) && !GENERIC_MERGE_STOPWORDS.has(token))
+    );
+    const mergeSetB = new Set(
+        (vectorB.mergeHints || [])
+            .map(token => String(token || '').toLowerCase().trim())
+            .filter(token => token.length >= 3 && !STOPWORDS.has(token) && !GENERIC_MERGE_STOPWORDS.has(token))
+    );
+    const S_merge = jaccardSimilarity(mergeSetA, mergeSetB);
+    const primaryTokensA = new Set(
+        tokenizeText(vectorA.primaryTopic)
+            .filter(token => !GENERIC_MERGE_STOPWORDS.has(token))
+    );
+    const primaryTokensB = new Set(
+        tokenizeText(vectorB.primaryTopic)
+            .filter(token => !GENERIC_MERGE_STOPWORDS.has(token))
+    );
+    const S_primary = normalizedOverlap(primaryTokensA, primaryTokensB);
+    const docMatch = vectorA.docType && vectorA.docType === vectorB.docType ? 1 : 0;
+    const entitiesA = vectorA.entities instanceof Set
+        ? vectorA.entities
+        : new Set(Array.isArray(vectorA.entities) ? vectorA.entities : []);
+    const entitiesB = vectorB.entities instanceof Set
+        ? vectorB.entities
+        : new Set(Array.isArray(vectorB.entities) ? vectorB.entities : []);
+    const S_entity = normalizedOverlap(entitiesA, entitiesB);
+    const genericPenalty = (() => {
+        const aGeneric = Boolean(vectorA.isGenericLanding);
+        const bGeneric = Boolean(vectorB.isGenericLanding);
+        if (aGeneric && bGeneric) return 0.75;
+        if (aGeneric || bGeneric) return 0.65;
+        return 1;
+    })();
+    const entityPenalty = (() => {
+        if (!entitiesA.size || !entitiesB.size) return 1;
+        if (S_entity > 0) return 1;
+        const articlePair = vectorA.docType === 'article' && vectorB.docType === 'article';
+        return articlePair ? 0.92 : 0.6;
+    })();
+    const topicPenalty = (() => {
+        if (!primaryTokensA.size || !primaryTokensB.size) return 0.95;
+        if (S_primary > 0) return 1;
+        if (S_topic >= 0.36) return 0.9;
+        return 0.7;
+    })();
     
     let score =
-        (0.18 * S_kw) +
-        (0.16 * S_topic) +
-        (0.10 * S_title) +
-        (0.10 * S_tfidf) +
-        (0.18 * S_embed) +
-        (0.12 * S_tax) +
-        (0.05 * S_url) +
-        (0.04 * S_dom) +
-        (0.03 * S_domTokens) +
-        (0.02 * S_lang);
+        (0.12 * S_kw) +
+        (0.17 * S_topic) +
+        (0.06 * S_title) +
+        (0.08 * S_tfidf) +
+        (0.14 * S_embed) +
+        (0.05 * S_sim) +
+        (0.07 * S_tax) +
+        (0.04 * S_url) +
+        (0.03 * S_dom) +
+        (0.02 * S_domTokens) +
+        (0.02 * S_lang) +
+        (0.07 * S_merge) +
+        (0.04 * docMatch) +
+        (0.04 * S_entity) +
+        (0.05 * S_primary);
     
     if (vectorA.youtubeTopic && vectorA.youtubeTopic === vectorB.youtubeTopic) {
-        score += 0.04;
+        score += 0.03;
     }
     
-    score *= langPenalty;
-    return Math.max(0, Math.min(score, 1));
+    score *= langPenalty * genericPenalty * entityPenalty * topicPenalty;
+    const finalScore = Math.max(0, Math.min(score, 1));
+    if (debugOut && typeof debugOut === 'object') {
+        debugOut.S_kw = S_kw;
+        debugOut.S_topic = S_topic;
+        debugOut.S_title = S_title;
+        debugOut.S_tfidf = S_tfidf;
+        debugOut.S_embed = S_embed;
+        debugOut.S_sim = S_sim;
+        debugOut.S_tax = S_tax;
+        debugOut.S_url = S_url;
+        debugOut.S_dom = S_dom;
+        debugOut.S_domTokens = S_domTokens;
+        debugOut.S_lang = S_lang;
+        debugOut.S_merge = S_merge;
+        debugOut.docMatch = docMatch;
+        debugOut.langPenalty = langPenalty;
+        debugOut.genericPenalty = genericPenalty;
+        debugOut.S_primary = S_primary;
+        debugOut.topicPenalty = topicPenalty;
+        debugOut.S_entity = S_entity;
+        debugOut.entityPenalty = entityPenalty;
+        debugOut.score = finalScore;
+    }
+    return finalScore;
 }
 
 function createUnionFind(size) {
@@ -2300,7 +3321,7 @@ function createUnionFind(size) {
     return { find, union };
 }
 
-function clusterTabsDeterministic(featureContext) {
+function clusterTabsDeterministic(featureContext, { debugLog = null } = {}) {
     const { vectors, tabData } = featureContext;
     if (!vectors || !vectors.length) {
         return [];
@@ -2309,13 +3330,132 @@ function clusterTabsDeterministic(featureContext) {
     const uf = createUnionFind(vectors.length);
     const similarityCache = new Map();
     
+    const borderlinePairs = [];
+    
     for (let i = 0; i < vectors.length; i++) {
         for (let j = i + 1; j < vectors.length; j++) {
-            const score = computeWeightedSimilarity(vectors[i], vectors[j]);
+            const metrics = {};
+            const score = computeWeightedSimilarity(vectors[i], vectors[j], metrics);
             const key = `${i}|${j}`;
             similarityCache.set(key, score);
+            if (debugLog) {
+                debugLog.stats = debugLog.stats || {};
+                debugLog.stats.pairComparisons = (debugLog.stats.pairComparisons || 0) + 1;
+            }
             if (score >= SIMILARITY_JOIN_THRESHOLD) {
                 uf.union(i, j);
+                if (debugLog) {
+                    debugLog.stats.pairUnions = (debugLog.stats.pairUnions || 0) + 1;
+                    const entryA = vectors[i]?.tabData || {};
+                    const entryB = vectors[j]?.tabData || {};
+                    const classificationA = entryA.classification || {};
+                    const classificationB = entryB.classification || {};
+                    const formatNumber = (value, digits = 3) =>
+                        typeof value === 'number' ? Number(value.toFixed(digits)) : null;
+                    const mergeHintsA = classificationA.mergeHints || vectors[i]?.mergeHints || [];
+                    const mergeHintsB = classificationB.mergeHints || vectors[j]?.mergeHints || [];
+                    const isBridge = Boolean((vectors[i]?.isGenericLanding || classificationA.isGenericLanding) !==
+                        (vectors[j]?.isGenericLanding || classificationB.isGenericLanding));
+                    debugLog.pairwise = debugLog.pairwise || [];
+                    debugLog.pairwise.push({
+                        phase: 'A',
+                        type: 'pair-join',
+                        reason: 'initial-similarity',
+                        vectorIndices: [i, j],
+                        tabIndices: [vectors[i]?.index, vectors[j]?.index],
+                        urls: [entryA.url, entryB.url],
+                        primaryTopics: [classificationA.primaryTopic || vectors[i]?.primaryTopic || '', classificationB.primaryTopic || vectors[j]?.primaryTopic || ''],
+                        primaryTopicMatch: Boolean(
+                            (classificationA.primaryTopic || vectors[i]?.primaryTopic) &&
+                            (classificationA.primaryTopic || vectors[i]?.primaryTopic) === (classificationB.primaryTopic || vectors[j]?.primaryTopic)
+                        ),
+                        docTypes: [classificationA.docType || vectors[i]?.docType || '', classificationB.docType || vectors[j]?.docType || ''],
+                        mergeHints: [mergeHintsA.slice(0, 4), mergeHintsB.slice(0, 4)],
+                        cosineEmb: formatNumber(metrics.S_embed),
+                        simHash: formatNumber(metrics.S_sim),
+                        jaccardHints: formatNumber(metrics.S_merge),
+                        taxBoost: formatNumber(metrics.S_tax),
+                        keywordBoost: formatNumber(metrics.S_kw),
+                        docTypeBoost: formatNumber(metrics.docMatch),
+                        genericPenalty: formatNumber(metrics.genericPenalty),
+                        langPenalty: formatNumber(metrics.langPenalty),
+                        finalScore: formatNumber(metrics.score, 4),
+                        threshold: SIMILARITY_JOIN_THRESHOLD,
+                        bridge: isBridge,
+                        bridgeReason: isBridge ? 'generic-landing mismatch' : null,
+                        timestamp: Date.now()
+                    });
+                }
+            } else if (score >= SIMILARITY_SPLIT_THRESHOLD) {
+                const domainMatch = Boolean(vectors[i]?.domain && vectors[i].domain === vectors[j]?.domain);
+                borderlinePairs.push({
+                    i,
+                    j,
+                    score,
+                    domainMatch,
+                    merge: typeof metrics.S_merge === 'number' ? metrics.S_merge : 0,
+                    primary: typeof metrics.S_primary === 'number' ? metrics.S_primary : 0,
+                    taxonomy: typeof metrics.S_tax === 'number' ? metrics.S_tax : 0,
+                    sim: typeof metrics.S_sim === 'number' ? metrics.S_sim : 0,
+                    embed: typeof metrics.S_embed === 'number' ? metrics.S_embed : 0
+                });
+            }
+        }
+    }
+    
+    if (borderlinePairs.length) {
+        borderlinePairs.sort((a, b) => b.score - a.score);
+        for (const pair of borderlinePairs) {
+            const rootA = uf.find(pair.i);
+            const rootB = uf.find(pair.j);
+            if (rootA === rootB) continue;
+            const meetsSecondary =
+                (pair.domainMatch && pair.merge >= 0.35) ||
+                (pair.primary >= 0.55 && pair.taxonomy >= 0.35) ||
+                (pair.sim >= 0.62) ||
+                (pair.embed >= 0.68);
+            if (pair.score >= SIMILARITY_JOIN_THRESHOLD || (meetsSecondary && pair.score >= SIMILARITY_SPLIT_THRESHOLD)) {
+                uf.union(pair.i, pair.j);
+                if (debugLog) {
+                    debugLog.stats = debugLog.stats || {};
+                    debugLog.stats.hysteresisUnions = (debugLog.stats.hysteresisUnions || 0) + 1;
+                    debugLog.stats.pairUnions = (debugLog.stats.pairUnions || 0) + 1;
+                    const entryA = vectors[pair.i]?.tabData || {};
+                    const entryB = vectors[pair.j]?.tabData || {};
+                    const classificationA = entryA.classification || {};
+                    const classificationB = entryB.classification || {};
+                    const mergeHintsA = classificationA.mergeHints || vectors[pair.i]?.mergeHints || [];
+                    const mergeHintsB = classificationB.mergeHints || vectors[pair.j]?.mergeHints || [];
+                    const formatNumber = (value, digits = 3) =>
+                        typeof value === 'number' ? Number(value.toFixed(digits)) : null;
+                    debugLog.pairwise = debugLog.pairwise || [];
+                    debugLog.pairwise.push({
+                        phase: 'A',
+                        type: 'pair-hysteresis',
+                        reason: 'borderline-merge',
+                        vectorIndices: [pair.i, pair.j],
+                        tabIndices: [vectors[pair.i]?.index, vectors[pair.j]?.index],
+                        urls: [entryA.url, entryB.url],
+                        primaryTopics: [classificationA.primaryTopic || vectors[pair.i]?.primaryTopic || '', classificationB.primaryTopic || vectors[pair.j]?.primaryTopic || ''],
+                        docTypes: [classificationA.docType || vectors[pair.i]?.docType || '', classificationB.docType || vectors[pair.j]?.docType || ''],
+                        mergeHints: [mergeHintsA.slice(0, 4), mergeHintsB.slice(0, 4)],
+                        cosineEmb: formatNumber(pair.embed),
+                        simHash: formatNumber(pair.sim),
+                        jaccardHints: formatNumber(pair.merge),
+                        taxBoost: formatNumber(pair.taxonomy),
+                        keywordBoost: formatNumber(pair.primary),
+                        docTypeBoost: classificationA.docType && classificationB.docType
+                            ? formatNumber(classificationA.docType === classificationB.docType ? 1 : 0)
+                            : null,
+                        genericPenalty: null,
+                        langPenalty: null,
+                        finalScore: formatNumber(pair.score, 4),
+                        threshold: SIMILARITY_SPLIT_THRESHOLD,
+                        bridge: Boolean((vectors[pair.i]?.isGenericLanding) !== (vectors[pair.j]?.isGenericLanding)),
+                        bridgeReason: null,
+                        timestamp: Date.now()
+                    });
+                }
             }
         }
     }
@@ -2334,7 +3474,7 @@ function clusterTabsDeterministic(featureContext) {
     let groups = Array.from(groupsMap.values());
     
     if (groups.length > 1) {
-        groups = mergeSmallSimilarGroups(groups, vectors, similarityCache);
+        groups = mergeSmallSimilarGroups(groups, vectors, similarityCache, { debugLog });
     }
     
     if (groups.length > 1) {
@@ -2379,7 +3519,7 @@ function clusterTabsDeterministic(featureContext) {
     }
     
     if (groups.length > 1) {
-        groups = mergeYouTubeChannelSingletons(groups, vectors, tabData);
+        groups = mergeYouTubeChannelSingletons(groups, vectors, tabData, { debugLog });
     }
     
     const enrichedGroups = groups.map(group => enrichGroupFromVectors(group.vectorIndices, vectors, similarityCache));
@@ -2394,7 +3534,7 @@ function clusterTabsDeterministic(featureContext) {
     return enrichedGroups;
 }
 
-function mergeSmallSimilarGroups(groups, vectors, similarityCache) {
+function mergeSmallSimilarGroups(groups, vectors, similarityCache, { debugLog = null } = {}) {
     if (!Array.isArray(groups) || groups.length <= 1) {
         return groups;
     }
@@ -2452,12 +3592,15 @@ function mergeSmallSimilarGroups(groups, vectors, similarityCache) {
             const sizeB = groupB.vectorIndices.length;
             if (sizeA > SMALL_GROUP_MAX_SIZE && sizeB > SMALL_GROUP_MAX_SIZE) continue;
 
+            debugLog?.stats && (debugLog.stats.smallGroupComparisons = (debugLog.stats.smallGroupComparisons || 0) + 1);
             let bestScore = 0;
+            let bestPair = null;
             for (const idxA of groupA.vectorIndices) {
                 for (const idxB of groupB.vectorIndices) {
                     const score = getVectorSimilarity(idxA, idxB);
                     if (score > bestScore) {
                         bestScore = score;
+                        bestPair = [idxA, idxB];
                         if (bestScore >= 0.99) break;
                     }
                 }
@@ -2473,12 +3616,67 @@ function mergeSmallSimilarGroups(groups, vectors, similarityCache) {
             const meetsTaxonomyBoost = taxonomyOverlap >= CROSS_GROUP_TAXONOMY_OVERLAP &&
                 (bestScore >= CROSS_GROUP_MERGE_THRESHOLD * 0.6 || meetsKeywordOrTopic);
 
-            if (meetsThreshold && (meetsKeywordOrTopic || taxonomyOverlap >= CROSS_GROUP_TAXONOMY_OVERLAP)) {
+            const shouldMerge = (meetsThreshold && (meetsKeywordOrTopic || taxonomyOverlap >= CROSS_GROUP_TAXONOMY_OVERLAP))
+                || meetsTaxonomyBoost;
+
+            if (shouldMerge) {
                 groupUF.union(i, j);
                 merged = true;
-            } else if (meetsTaxonomyBoost) {
-                groupUF.union(i, j);
-                merged = true;
+                if (debugLog) {
+                    debugLog.stats.smallGroupUnions = (debugLog.stats.smallGroupUnions || 0) + 1;
+                    const formatNumber = (value, digits = 3) => typeof value === 'number' ? Number(value.toFixed(digits)) : null;
+                    let debugInfo = null;
+                    let vectorA = null;
+                    let vectorB = null;
+                    if (Array.isArray(bestPair)) {
+                        vectorA = vectors[bestPair[0]];
+                        vectorB = vectors[bestPair[1]];
+                        debugInfo = {};
+                        computeWeightedSimilarity(vectorA, vectorB, debugInfo);
+                    }
+                    const entryA = vectorA?.tabData || {};
+                    const entryB = vectorB?.tabData || {};
+                    const classificationA = entryA.classification || {};
+                    const classificationB = entryB.classification || {};
+                    const mergeHintsA = classificationA.mergeHints || vectorA?.mergeHints || [];
+                    const mergeHintsB = classificationB.mergeHints || vectorB?.mergeHints || [];
+                    const bridge = Boolean(
+                        (vectorA?.isGenericLanding || classificationA.isGenericLanding) !==
+                        (vectorB?.isGenericLanding || classificationB.isGenericLanding)
+                    );
+                    debugLog.smallGroup = debugLog.smallGroup || [];
+                    const mergeType = meetsThreshold && (meetsKeywordOrTopic || taxonomyOverlap >= CROSS_GROUP_TAXONOMY_OVERLAP) ? 'semantic' : 'taxonomy';
+                    debugLog.smallGroup.push({
+                        phase: 'B',
+                        type: mergeType,
+                        groups: [i, j],
+                        sizes: [sizeA, sizeB],
+                        reason: mergeType,
+                        bestScore: formatNumber(debugInfo?.score, 4) ?? formatNumber(bestScore, 4),
+                        keywordOverlap: formatNumber(keywordOverlap),
+                        topicOverlap: formatNumber(topicOverlap),
+                        taxonomyOverlap: formatNumber(taxonomyOverlap),
+                        threshold: CROSS_GROUP_MERGE_THRESHOLD,
+                        primaryTopics: [
+                            classificationA.primaryTopic || vectorA?.primaryTopic || '',
+                            classificationB.primaryTopic || vectorB?.primaryTopic || ''
+                        ],
+                        docTypes: [
+                            classificationA.docType || vectorA?.docType || '',
+                            classificationB.docType || vectorB?.docType || ''
+                        ],
+                        mergeHints: [mergeHintsA.slice(0, 4), mergeHintsB.slice(0, 4)],
+                        cosineEmb: formatNumber(debugInfo?.S_embed),
+                        jaccardHints: formatNumber(debugInfo?.S_merge),
+                        taxBoost: formatNumber(debugInfo?.S_tax),
+                        keywordBoost: formatNumber(debugInfo?.S_kw),
+                        docTypeBoost: formatNumber(debugInfo?.docMatch),
+                        genericPenalty: formatNumber(debugInfo?.genericPenalty),
+                        bridge,
+                        bridgeReason: bridge ? 'generic-landing mismatch' : null,
+                        timestamp: Date.now()
+                    });
+                }
             }
         }
     }
@@ -2507,7 +3705,7 @@ function mergeSmallSimilarGroups(groups, vectors, similarityCache) {
     }));
 }
 
-function mergeYouTubeChannelSingletons(groups, vectors, tabData) {
+function mergeYouTubeChannelSingletons(groups, vectors, tabData, { debugLog = null } = {}) {
     if (!Array.isArray(groups) || groups.length <= 1) {
         return groups;
     }
@@ -2540,12 +3738,44 @@ function mergeYouTubeChannelSingletons(groups, vectors, tabData) {
     
     let merged = false;
     const groupUF = createUnionFind(groups.length);
-    for (const indices of channelGroups.values()) {
+    for (const [channelKey, indices] of channelGroups.entries()) {
         if (!indices || indices.length <= 1) continue;
         const [first, ...rest] = indices;
         rest.forEach(otherIndex => {
             groupUF.union(first, otherIndex);
             merged = true;
+            if (debugLog) {
+                debugLog.stats.channelUnions = (debugLog.stats.channelUnions || 0) + 1;
+                const vectorA = groups[first]?.vectorIndices?.[0] !== undefined ? vectors[groups[first].vectorIndices[0]] : null;
+                const vectorB = groups[otherIndex]?.vectorIndices?.[0] !== undefined ? vectors[groups[otherIndex].vectorIndices[0]] : null;
+                const entryA = vectorA?.tabData || {};
+                const entryB = vectorB?.tabData || {};
+                const classificationA = entryA.classification || {};
+                const classificationB = entryB.classification || {};
+                const channelName = entryA.youtubeAnalysis?.channel || entryB.youtubeAnalysis?.channel || channelKey;
+                debugLog.channelMerges = debugLog.channelMerges || [];
+                debugLog.channelMerges.push({
+                    phase: 'B',
+                    type: 'channel',
+                    reason: 'channel-singletons',
+                    groups: [first, otherIndex],
+                    urls: [entryA.url, entryB.url],
+                    channel: channelName,
+                    primaryTopics: [
+                        classificationA.primaryTopic || vectorA?.primaryTopic || '',
+                        classificationB.primaryTopic || vectorB?.primaryTopic || ''
+                    ],
+                    docTypes: [
+                        classificationA.docType || vectorA?.docType || '',
+                        classificationB.docType || vectorB?.docType || ''
+                    ],
+                    mergeHints: [
+                        (classificationA.mergeHints || vectorA?.mergeHints || []).slice(0, 4),
+                        (classificationB.mergeHints || vectorB?.mergeHints || []).slice(0, 4)
+                    ],
+                    timestamp: Date.now()
+                });
+            }
         });
     }
     
@@ -2582,6 +3812,12 @@ function enrichGroupFromVectors(vectorIndices, vectors, similarityCache) {
     const domainFrequency = new Map();
     const languageFrequency = new Map();
     const taxonomyFrequency = new Map();
+    const primaryTopicFrequency = new Map();
+    const docTypeFrequency = new Map();
+    const entityFrequency = new Map();
+    const entityLabelMap = new Map();
+    const mergeHintFrequency = new Map();
+    let genericLandingCount = 0;
     
     uniqueVectorIndices.forEach(vectorIdx => {
         const vector = vectors?.[vectorIdx];
@@ -2610,6 +3846,35 @@ function enrichGroupFromVectors(vectorIndices, vectors, similarityCache) {
         if (vector.language) {
             languageFrequency.set(vector.language, (languageFrequency.get(vector.language) || 0) + 1);
         }
+        const primaryTopic = (vector.primaryTopic || vector.tabData?.classification?.primaryTopic || '').toLowerCase().trim();
+        if (primaryTopic) {
+            primaryTopicFrequency.set(primaryTopic, (primaryTopicFrequency.get(primaryTopic) || 0) + 1);
+        }
+        const docType = (vector.docType || vector.tabData?.classification?.docType || '').toLowerCase().trim();
+        if (docType) {
+            docTypeFrequency.set(docType, (docTypeFrequency.get(docType) || 0) + 1);
+        }
+        const mergeHints = Array.isArray(vector.mergeHints)
+            ? vector.mergeHints
+            : (vector.tabData?.classification?.mergeHints || []);
+        mergeHints.forEach(hint => {
+            const token = String(hint || '').toLowerCase().trim();
+            if (!token || STOPWORDS.has(token)) return;
+            mergeHintFrequency.set(token, (mergeHintFrequency.get(token) || 0) + 1);
+        });
+        const entityList = vector.tabData?.classification?.entities || [];
+        entityList.forEach(entity => {
+            const label = String(entity || '').trim();
+            if (!label) return;
+            const key = label.toLowerCase();
+            entityFrequency.set(key, (entityFrequency.get(key) || 0) + 1);
+            if (!entityLabelMap.has(key)) {
+                entityLabelMap.set(key, label);
+            }
+        });
+        if (vector.isGenericLanding || vector.tabData?.classification?.isGenericLanding) {
+            genericLandingCount += 1;
+        }
     });
     
     const centroidTokens = Array.from(centroid.entries())
@@ -2637,6 +3902,31 @@ function enrichGroupFromVectors(vectorIndices, vectors, similarityCache) {
     
     const tabIndices = Array.from(tabIndexSet).sort((a, b) => a - b);
     
+    const pickTopKeys = (frequencyMap, count = 1) => {
+        return Array.from(frequencyMap.entries())
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, count)
+            .map(([key]) => key);
+    };
+    const primaryTopicToken = pickTopKeys(primaryTopicFrequency, 1)[0] || '';
+    const primaryTopicLabel = primaryTopicToken
+        ? (titleCaseFromTokens(tokenizeText(primaryTopicToken)) || primaryTopicToken)
+        : '';
+    const primaryTopicCount = primaryTopicToken ? (primaryTopicFrequency.get(primaryTopicToken) || 0) : 0;
+    const primaryTopicPurity = uniqueVectorIndices.length
+        ? primaryTopicCount / uniqueVectorIndices.length
+        : 0;
+    const docTypeToken = pickTopKeys(docTypeFrequency, 1)[0] || '';
+    const mergeHintsTop = pickTopKeys(mergeHintFrequency, 6);
+    const topEntityKeys = pickTopKeys(entityFrequency, 4);
+    const topEntities = topEntityKeys.map(key => {
+        const label = entityLabelMap.get(key) || key;
+        return titleCaseFromTokens(tokenizeText(label)) || label;
+    });
+    const genericLandingRatio = uniqueVectorIndices.length
+        ? genericLandingCount / uniqueVectorIndices.length
+        : 0;
+    
     return {
         tabIndices,
         vectorIndices: uniqueVectorIndices,
@@ -2647,12 +3937,18 @@ function enrichGroupFromVectors(vectorIndices, vectors, similarityCache) {
         languageMode,
         representativeTabIndices,
         taxonomyTags,
+        mergeHints: mergeHintsTop,
+        primaryTopic: primaryTopicLabel,
+        docType: docTypeToken,
+        entities: topEntities,
+        genericLandingRatio,
+        primaryTopicPurity,
         name: '',
         summary: []
     };
 }
 
-function mergeSimilarNamedGroups(groups, featureContext) {
+function mergeSimilarNamedGroups(groups, featureContext, { debugLog = null } = {}) {
     if (!Array.isArray(groups) || groups.length <= 1) {
         return groups;
     }
@@ -2670,9 +3966,10 @@ function mergeSimilarNamedGroups(groups, featureContext) {
     
     const bestGroupSimilarity = (groupA, groupB) => {
         if (!groupA?.vectorIndices?.length || !groupB?.vectorIndices?.length) {
-            return 0;
+            return { score: 0, pair: null };
         }
         let best = 0;
+        let bestPair = null;
         for (const idxA of groupA.vectorIndices) {
             for (const idxB of groupB.vectorIndices) {
                 const key = idxA < idxB ? `${idxA}|${idxB}` : `${idxB}|${idxA}`;
@@ -2683,13 +3980,14 @@ function mergeSimilarNamedGroups(groups, featureContext) {
                 }
                 if (score > best) {
                     best = score;
+                    bestPair = [idxA, idxB];
                     if (best >= 0.99) {
-                        return best;
+                        return { score: best, pair: bestPair };
                     }
                 }
             }
         }
-        return best;
+        return { score: best, pair: bestPair };
     };
     
     for (let i = 0; i < groups.length; i++) {
@@ -2702,20 +4000,64 @@ function mergeSimilarNamedGroups(groups, featureContext) {
             if (isPlaceholderGroupName(groups[i].name) && isPlaceholderGroupName(groups[j].name)) {
                 continue;
             }
+            if (debugLog) {
+                debugLog.stats = debugLog.stats || {};
+                debugLog.stats.nameComparisons = (debugLog.stats.nameComparisons || 0) + 1;
+            }
             const overlap = normalizedOverlap(tokensA, tokensB);
             if (overlap < GROUP_NAME_SIMILARITY_THRESHOLD) {
                 continue;
             }
-            const vectorSimilarity = bestGroupSimilarity(groups[i], groups[j]);
-            if (vectorSimilarity >= GROUP_NAME_VECTOR_THRESHOLD) {
+            const similarityResult = bestGroupSimilarity(groups[i], groups[j]);
+            if (similarityResult.score >= GROUP_NAME_VECTOR_THRESHOLD) {
                 uf.union(i, j);
                 merged = true;
                 mergeSummaries.push({
                     a: groups[i].name,
                     b: groups[j].name,
                     labelSimilarity: overlap.toFixed(2),
-                    vectorSimilarity: vectorSimilarity.toFixed(2)
+                    vectorSimilarity: similarityResult.score.toFixed(2)
                 });
+                if (debugLog) {
+                    debugLog.stats.nameUnions = (debugLog.stats.nameUnions || 0) + 1;
+                    const formatNumber = (value, digits = 3) => typeof value === 'number' ? Number(value.toFixed(digits)) : null;
+                    let debugInfo = null;
+                    if (Array.isArray(similarityResult.pair)) {
+                        const [idxA, idxB] = similarityResult.pair;
+                        const vectorA = vectors[idxA];
+                        const vectorB = vectors[idxB];
+                        if (vectorA && vectorB) {
+                            debugInfo = {};
+                            computeWeightedSimilarity(vectorA, vectorB, debugInfo);
+                        }
+                    }
+                    debugLog.nameMerges = debugLog.nameMerges || [];
+                    debugLog.nameMerges.push({
+                        phase: 'B',
+                        type: 'label-merge',
+                        reason: 'label-similarity',
+                        groups: [i, j],
+                        names: [groups[i].name, groups[j].name],
+                        labelOverlap: formatNumber(overlap),
+                        vectorSimilarity: formatNumber(similarityResult.score),
+                        primaryTopics: [groups[i].primaryTopic || '', groups[j].primaryTopic || ''],
+                        docTypes: [groups[i].docType || '', groups[j].docType || ''],
+                        mergeHints: [
+                            Array.isArray(groups[i].mergeHints) ? groups[i].mergeHints.slice(0, 4) : [],
+                            Array.isArray(groups[j].mergeHints) ? groups[j].mergeHints.slice(0, 4) : []
+                        ],
+                        thresholds: {
+                            label: GROUP_NAME_SIMILARITY_THRESHOLD,
+                            vector: GROUP_NAME_VECTOR_THRESHOLD
+                        },
+                        cosineEmb: formatNumber(debugInfo?.S_embed),
+                        jaccardHints: formatNumber(debugInfo?.S_merge),
+                        taxBoost: formatNumber(debugInfo?.S_tax),
+                        keywordBoost: formatNumber(debugInfo?.S_kw),
+                        docTypeBoost: formatNumber(debugInfo?.docMatch),
+                        timestamp: Date.now()
+                    });
+                }
             }
         }
     }
@@ -2838,6 +4180,41 @@ async function assignGroupLabels(groups, tabDataForAI) {
     let aiLabelAttempts = 0;
     const labelFailureReasons = new Set();
     
+    const buildFallbackBlurb = (descriptor, group, labelValue) => {
+        const keywordPool = [
+            ...(descriptor.centroidKeywords || []),
+            ...(descriptor.mergeHints || []),
+            ...(descriptor.taxonomyTags || []),
+            ...(group.mergeHints || []),
+            ...(group.keywords || [])
+        ];
+        const unique = [];
+        for (const token of keywordPool) {
+            const clean = String(token || '').trim();
+            if (!clean) continue;
+            const tokens = tokenizeText(clean);
+            if (!tokens.length) continue;
+            const phrase = titleCaseFromTokens(tokens.slice(0, 2)) || clean;
+            if (phrase && !unique.includes(phrase)) {
+                unique.push(phrase);
+            }
+            if (unique.length >= 3) {
+                break;
+            }
+        }
+        if (!unique.length) {
+            const fallback = titleCaseFromTokens(tokenizeText(labelValue || 'General Focus')) || 'Major Topics';
+            return `Insights on ${fallback} topics and trends`;
+        }
+        if (unique.length === 1) {
+            return `Insights on ${unique[0]} topics and trends`;
+        }
+        if (unique.length === 2) {
+            return `Insights on ${unique[0]} and ${unique[1]} topics`;
+        }
+        return `Highlights include ${unique[0]}, ${unique[1]} and ${unique[2]}`;
+    };
+    
     if (!accessibleTab) {
         labelFailureReasons.add('No accessible tab with Chrome AI support');
     } else {
@@ -2871,16 +4248,22 @@ async function assignGroupLabels(groups, tabDataForAI) {
         }
 
         let label = cachedEntry ? cachedEntry.label : '';
+        let blurb = cachedEntry ? cachedEntry.blurb || '' : '';
 
         const exemplarTabs = group.representativeTabIndices
             .map(index => {
                 const entry = indexMap.get(index) || {};
                 const features = entry.semanticFeatures || {};
+                const classification = entry.classification || {};
                 return {
                     title: entry.title || '',
                     domain: entry.domain || '',
                     topic: features.topic || '',
-                    keywords: (features.keywords || []).slice(0, 5)
+                    keywords: (features.mergeHints || features.keywords || []).slice(0, 5),
+                    primaryTopic: classification.primaryTopic || features.primaryTopic || '',
+                    docType: classification.docType || features.docType || '',
+                    entities: (classification.entities || features.entities || []).slice(0, 3),
+                    mergeHints: (classification.mergeHints || features.mergeHints || features.keywords || []).slice(0, 5)
                 };
             })
             .filter(tab => tab.title);
@@ -2891,10 +4274,15 @@ async function assignGroupLabels(groups, tabDataForAI) {
             exemplarTabs: exemplarTabs.slice(0, 2),
             domainMode: group.domainMode || '',
             languageMode: group.languageMode || '',
-            taxonomyTags: Array.isArray(group.taxonomyTags) ? group.taxonomyTags.slice(0, 6) : []
+            taxonomyTags: Array.isArray(group.taxonomyTags) ? group.taxonomyTags.slice(0, 6) : [],
+            primaryTopic: group.primaryTopic || '',
+            docType: group.docType || '',
+            mergeHints: Array.isArray(group.mergeHints) ? group.mergeHints.slice(0, 6) : [],
+            entities: Array.isArray(group.entities) ? group.entities.slice(0, 4) : [],
+            genericLandingRatio: typeof group.genericLandingRatio === 'number' ? group.genericLandingRatio : 0
         };
 
-        if (!label && accessibleTab && aiLabelReady && aiLabelAttempts < MAX_AI_LABEL_GROUPS) {
+        if ((!label || !blurb) && accessibleTab && aiLabelReady && aiLabelAttempts < MAX_AI_LABEL_GROUPS) {
             try {
                 aiLabelAttempts += 1;
                 const scriptPromise = chrome.scripting.executeScript({
@@ -2905,9 +4293,13 @@ async function assignGroupLabels(groups, tabDataForAI) {
                 });
                 const results = await withTimeout(scriptPromise, AI_LABEL_TIMEOUT, 'AI label timeout');
                 
-                if (results && results[0] && results[0].result && results[0].result.ok && results[0].result.label) {
-                    label = results[0].result.label;
-                } else if (results && results[0] && results[0].result && !results[0].result.ok) {
+                const payload = results && results[0] && results[0].result;
+                if (payload && payload.ok && payload.label) {
+                    label = payload.label;
+                    if (payload.blurb) {
+                        blurb = String(payload.blurb).trim().slice(0, 160);
+                    }
+                } else if (payload && !payload.ok) {
                     const status = results[0].result.status || null;
                     const errorMessage = results[0].result.error || 'Language model not ready';
                     labelFailureReasons.add(status || errorMessage);
@@ -2940,15 +4332,21 @@ async function assignGroupLabels(groups, tabDataForAI) {
             label = titleCaseFromTokens(fallbackTokens) ||
                 (descriptor.domainMode ? titleCaseFromTokens([descriptor.domainMode]) : `Group ${groups.indexOf(group) + 1}`);
         }
+        if (!blurb) {
+            blurb = buildFallbackBlurb(descriptor, group, label);
+        }
         
         if (centroidSignature) {
-            updatedCache[centroidSignature] = { label, timestamp: Date.now() };
+            updatedCache[centroidSignature] = { label, blurb, timestamp: Date.now() };
             cacheDirty = true;
         }
         
         group.name = label;
         group.keywords = group.keywords.slice(0, 10);
         group.taxonomyTags = descriptor.taxonomyTags;
+        group.displayBlurb = blurb;
+        group.oneLiner = blurb;
+        group.blurb = blurb;
     }
     
     if (cacheDirty) {
@@ -3142,6 +4540,104 @@ function checkLanguageModelAvailabilityInPage() {
     })();
 }
 
+function judgeTabSimilarityInPage(payload) {
+    function resolveLanguageModelApi() {
+        const scope = typeof self !== 'undefined' ? self : (typeof window !== 'undefined' ? window : globalThis);
+        return (
+            scope?.LanguageModel ||
+            scope?.ai?.languageModel ||
+            scope?.aiOriginTrial?.languageModel ||
+            scope?.window?.ai?.languageModel ||
+            null
+        );
+    }
+    
+    return (async () => {
+        try {
+            const languageModelApi = resolveLanguageModelApi();
+            if (!languageModelApi) {
+                return { ok: false, error: 'Language Model API not available' };
+            }
+            const language = (payload?.language || 'en').toString().split('-')[0] || 'en';
+            let session;
+            try {
+                session = await languageModelApi.create({
+                    language,
+                    monitor(monitor) {
+                        monitor.addEventListener('downloadprogress', (event) => {
+                            console.log(`Pairwise LM download ${(event.loaded * 100).toFixed(1)}%`);
+                        });
+                    }
+                });
+            } catch (createError) {
+                console.warn('judgeTabSimilarityInPage: languageModel.create with monitor failed, retrying without monitor', createError);
+                session = await languageModelApi.create({ language });
+            }
+            if (!session) {
+                throw new Error('Failed to create language model session');
+            }
+            
+            const [tabA, tabB] = (payload?.tabs || []).map(tab => tab || {});
+            const stringifyList = (list, fallback) => (Array.isArray(list) && list.length ? list.join(', ') : fallback);
+            const makeSection = (label, tab) => {
+                const summaryLines = Array.isArray(tab.summaryBullets) && tab.summaryBullets.length
+                    ? tab.summaryBullets.map(item => `  - ${String(item || '').trim()}`).join('\n')
+                    : '  - (no summary bullets)';
+                return `${label}:
+Title: ${tab.title || '—'}
+URL: ${tab.url || '—'}
+Domain: ${tab.domain || '—'}
+Doc type: ${tab.docType || 'unknown'}
+Primary topic: ${tab.primaryTopic || '—'}
+Subtopics: ${stringifyList(tab.subtopics, 'none')}
+Entities: ${stringifyList(tab.entities, 'none')}
+Merge hints: ${stringifyList(tab.mergeHints, 'none')}
+Meta: ${(tab.meta || '').slice(0, 240) || '—'}
+Content sample: ${(tab.content || '').slice(0, 320) || '—'}
+Summary bullets:
+${summaryLines}`;
+            };
+            
+            const prompt = `
+Decide if two browser tabs should belong to the same thematic cluster.
+
+Return ONLY JSON:
+{
+  "same_topic": true|false,
+  "confidence": number (0-1),
+  "reason": "max 2 sentences"
+}
+
+Consider topic, intent, entities, and doc type. Avoid merging pages that have only generic overlaps.
+
+${makeSection('TAB A', tabA)}
+
+${makeSection('TAB B', tabB)}
+            `.trim();
+            
+            const raw = await session.prompt(prompt);
+            const asString = typeof raw === 'string' ? raw : String(raw ?? '');
+            const match = asString.match(/\{[\s\S]*\}/);
+            if (!match) {
+                throw new Error('LM verification returned no JSON object');
+            }
+            const parsed = JSON.parse(match[0]);
+            return {
+                ok: true,
+                sameTopic: Boolean(parsed.same_topic),
+                confidence: typeof parsed.confidence === 'number' ? Math.max(0, Math.min(1, parsed.confidence)) : 0,
+                reason: String(parsed.reason || '').slice(0, 240)
+            };
+        } catch (error) {
+            console.error('judgeTabSimilarityInPage failed:', error);
+            return {
+                ok: false,
+                error: error?.message || String(error)
+            };
+        }
+    })();
+}
+
 /**
  * Εκτελείται στο MAIN world: εξάγει topic/keywords για ένα tab
  */
@@ -3156,14 +4652,212 @@ function generateTabFeaturesInPage(descriptor) {
             null
         );
     }
+
+    const sourceLanguage = (() => {
+        const candidate =
+            descriptor?.sourceLanguage ||
+            descriptor?.language ||
+            (typeof navigator !== 'undefined' ? navigator.language : '') ||
+            'en';
+        return String(candidate).split('-')[0] || 'en';
+    })();
+    const targetLanguage = 'en';
+    const sessionLanguage = targetLanguage;
+    const needsTranslation = sourceLanguage !== targetLanguage;
+
+    function resolveSummarizerApi() {
+        const scope = typeof self !== 'undefined' ? self : (typeof window !== 'undefined' ? window : globalThis);
+        return (
+            scope?.Summarizer ||
+            scope?.ai?.summarizer ||
+            scope?.ai?.Summarizer ||
+            scope?.aiOriginTrial?.summarizer ||
+            scope?.window?.ai?.Summarizer ||
+            null
+        );
+    }
     
-    function sanitizeKeywords(list) {
+    function sanitizeList(list, { limit = 6, toLower = true, minLength = 2, banned = [] } = {}) {
         if (!Array.isArray(list)) return [];
-        return Array.from(new Set(
-            list
-                .map(item => String(item || '').toLowerCase().trim())
-                .filter(token => token.length >= 3)
-        )).slice(0, 8);
+        const bannedSet = new Set(banned.map(item => String(item || '').toLowerCase()));
+        const result = [];
+        for (const item of list) {
+            if (item === null || item === undefined) continue;
+            let token = String(item).trim();
+            if (!token) continue;
+            const comparisonToken = token.toLowerCase();
+            if (bannedSet.has(comparisonToken)) continue;
+            if (toLower) {
+                token = comparisonToken;
+            }
+            if (token.length < minLength) continue;
+            if (!result.includes(token)) {
+                result.push(token);
+            }
+            if (result.length >= limit) break;
+        }
+        return result;
+    }
+    
+    function parseSummarizerOutput(summary) {
+        if (!summary) {
+            return [];
+        }
+        if (Array.isArray(summary)) {
+            return summary
+                .map(item => String(item || '').trim())
+                .filter(Boolean)
+                .slice(0, 6);
+        }
+        if (typeof summary === 'string') {
+            return summary
+                .split(/\n+/)
+                .map(line => line.replace(/^[\s•\-–—\d\.]+/, '').trim())
+                .filter(Boolean)
+                .slice(0, 6);
+        }
+        if (summary && typeof summary === 'object') {
+            if (Array.isArray(summary.points)) {
+                return summary.points
+                    .map(item => String(item || '').trim())
+                    .filter(Boolean)
+                    .slice(0, 6);
+            }
+            if (summary.summary) {
+                return [String(summary.summary).trim()].filter(Boolean);
+            }
+        }
+        return [];
+    }
+    
+    function buildSummaryInput(desc) {
+        if (!desc) return '';
+        const sections = [];
+        if (desc.title) sections.push(`Title: ${desc.title}`);
+        if (desc.metaDescription) sections.push(`Meta: ${desc.metaDescription}`);
+        if (Array.isArray(desc.headings) && desc.headings.length) {
+            const headingLines = desc.headings.slice(0, 6).map(heading => `- ${heading}`);
+            sections.push(`Headings:\n${headingLines.join('\n')}`);
+        }
+        if (desc.topicHints) sections.push(`Existing hints: ${desc.topicHints}`);
+        if (desc.youtube) {
+            if (desc.youtube.topic) sections.push(`YouTube topic: ${desc.youtube.topic}`);
+            if (Array.isArray(desc.youtube.tags) && desc.youtube.tags.length) {
+                sections.push(`YouTube tags: ${desc.youtube.tags.slice(0, 8).join(', ')}`);
+            }
+            if (desc.youtube.description) {
+                sections.push(`YouTube description: ${desc.youtube.description.slice(0, 1200)}`);
+            }
+        }
+        if (desc.content) {
+            sections.push(`Content sample:\n${desc.content.slice(0, 2400)}`);
+        }
+        return sections.join('\n\n').slice(0, 3600);
+    }
+    
+    function fallbackSummary(desc) {
+        const bullets = [];
+        if (!desc) return bullets;
+        if (Array.isArray(desc.summaryBullets) && desc.summaryBullets.length) {
+            bullets.push(...desc.summaryBullets.map(item => String(item || '').trim()).filter(Boolean));
+        }
+        if (desc.metaDescription) {
+            bullets.push(desc.metaDescription.trim());
+        }
+        if (Array.isArray(desc.headings)) {
+            for (const heading of desc.headings) {
+                if (bullets.length >= 6) break;
+                const trimmed = String(heading || '').trim();
+                if (trimmed) bullets.push(trimmed);
+            }
+        }
+        if (desc.content && bullets.length < 6) {
+            const sentences = desc.content
+                .split(/(?<=[\.!\?])\s+/)
+                .map(sentence => sentence.trim())
+                .filter(Boolean);
+            for (const sentence of sentences) {
+                if (bullets.length >= 6) break;
+                bullets.push(sentence);
+            }
+        }
+        return bullets.slice(0, 6);
+    }
+    
+    function parseJsonResponse(raw) {
+        if (raw === null || raw === undefined) {
+            throw new Error('Empty language model response');
+        }
+        const asString = typeof raw === 'string' ? raw : String(raw);
+        const match = asString.match(/\{[\s\S]*\}/);
+        const candidate = match ? match[0] : asString.trim();
+        try {
+            return JSON.parse(candidate);
+        } catch (error) {
+            const parsingError = new Error('Invalid JSON response from language model');
+            parsingError.cause = error;
+            throw parsingError;
+        }
+    }
+    
+    function buildClassificationPrompt(summaryPoints, desc, summarizerStatus) {
+        const summarySection = summaryPoints.length
+            ? summaryPoints.map(point => `- ${point}`).join('\n')
+            : '- (insufficient summary; rely on metadata)';
+        const metaLines = [];
+        if (desc.title) metaLines.push(`Title: ${desc.title}`);
+        if (desc.url) metaLines.push(`URL: ${desc.url}`);
+        if (desc.domain) metaLines.push(`Domain: ${desc.domain}`);
+        if (desc.language) metaLines.push(`Language: ${desc.language}`);
+        if (Array.isArray(desc.headings) && desc.headings.length) {
+            metaLines.push(`Headings: ${desc.headings.slice(0, 5).join(' | ')}`);
+        }
+        if (Array.isArray(desc.metaKeywords) && desc.metaKeywords.length) {
+            metaLines.push(`Meta keywords: ${desc.metaKeywords.slice(0, 8).join(', ')}`);
+        }
+        if (desc.metaDescription) {
+            metaLines.push(`Meta description: ${desc.metaDescription.slice(0, 240)}`);
+        }
+        if (desc.youtube) {
+            if (desc.youtube.topic) metaLines.push(`YouTube topic: ${desc.youtube.topic}`);
+            if (Array.isArray(desc.youtube.tags) && desc.youtube.tags.length) {
+                metaLines.push(`YouTube tags: ${desc.youtube.tags.slice(0, 6).join(', ')}`);
+            }
+        }
+        if (desc.topicHints) {
+            metaLines.push(`Legacy hints: ${desc.topicHints.slice(0, 240)}`);
+        }
+        if (desc.content) {
+            metaLines.push(`Content sample: ${desc.content.slice(0, 600)}`);
+        }
+        
+        return `
+You classify browser tabs into conceptual clusters.
+Return ONLY a JSON object with exactly these properties:
+{
+  "primary_topic": "<short noun phrase capturing the main concept>",
+  "subtopics": ["secondary themes, optional"],
+  "entities": ["organizations, products, or proper nouns"],
+  "doc_type": "article|category|landing|portal|docs",
+  "is_generic_landing": true|false,
+  "merge_hints": ["2-6 short lowercase keywords for clustering"]
+}
+
+Rules:
+	- Base your answer strictly on the provided summary and metadata.
+	- Prefer conceptual wording over generic labels (avoid "general", "misc", "various").
+	- merge_hints must be lowercase, 1-3 words each, no stop words, and must NOT include: research, news, blog, updates, topics.
+	- If the page is a broad landing/portal/home page, set is_generic_landing to true.
+	- doc_type must be one of the allowed values; pick "docs" for documentation/help pages.
+	- Respond in English even if the original material is in another language.
+	- Do not add comments or extra fields; output raw JSON only.
+
+Summary bullets (${summarizerStatus}):
+${summarySection}
+
+Metadata:
+${metaLines.join('\n')}
+        `.trim();
     }
     
     return (async () => {
@@ -3176,7 +4870,68 @@ function generateTabFeaturesInPage(descriptor) {
             };
         }
         
+        const summarizerApi = resolveSummarizerApi();
         const recoverablePattern = /(destroyed|closed|reset|disconnected|terminated)/i;
+        
+        async function getSummarizer(forceReset = false) {
+            if (!summarizerApi) {
+                return null;
+            }
+            if (forceReset) {
+                scope.__aitabSummarizerPromise = null;
+            }
+            if (!scope.__aitabSummarizerPromise) {
+                scope.__aitabSummarizerPromise = (async () => {
+                    if (typeof summarizerApi.availability === 'function') {
+                        let availability;
+                        try {
+                            availability = await summarizerApi.availability();
+                        } catch (availabilityError) {
+                            const error = new Error('Summarizer availability check failed');
+                            error.aiStatus = 'unknown';
+                            error.cause = availabilityError;
+                            throw error;
+                        }
+                        if (availability === 'unavailable') {
+                            const error = new Error('Summarizer API unavailable');
+                            error.aiStatus = availability;
+                            throw error;
+                        }
+                        if ((availability === 'downloadable' || availability === 'downloading') &&
+                            !(navigator.userActivation && navigator.userActivation.isActive)) {
+                            const error = new Error('Summarizer requires user activation to download');
+                            error.aiStatus = availability;
+                            throw error;
+                        }
+                    }
+                    try {
+                        return await summarizerApi.create({
+                            type: 'key-points',
+                            format: 'plain-text',
+                            length: 'short',
+                            monitor(monitor) {
+                                monitor.addEventListener('downloadprogress', (event) => {
+                                    console.log(`Summarizer download ${(event.loaded * 100).toFixed(1)}%`);
+                                });
+                            }
+                        });
+                    } catch (error) {
+                        console.warn('Summarizer.create with monitor failed, retrying without monitor:', error);
+                        return await summarizerApi.create({
+                            type: 'key-points',
+                            format: 'plain-text',
+                            length: 'short'
+                        });
+                    }
+                })();
+            }
+            try {
+                return await scope.__aitabSummarizerPromise;
+            } catch (error) {
+                scope.__aitabSummarizerPromise = null;
+                throw error;
+            }
+        }
         
         async function getSession(forceReset = false) {
             if (forceReset) {
@@ -3218,6 +4973,7 @@ function generateTabFeaturesInPage(descriptor) {
                     
                     try {
                         return await languageModelApi.create({
+                            language: sessionLanguage,
                             monitor(monitor) {
                                 monitor.addEventListener('downloadprogress', (event) => {
                                     console.log(`Feature extraction language model download ${(event.loaded * 100).toFixed(1)}%`);
@@ -3226,7 +4982,7 @@ function generateTabFeaturesInPage(descriptor) {
                         });
                     } catch (error) {
                         console.warn('LanguageModel.create with monitor failed, retrying without monitor:', error);
-                        return await languageModelApi.create();
+                        return await languageModelApi.create({ language: sessionLanguage });
                     }
                 })();
             }
@@ -3243,83 +4999,269 @@ function generateTabFeaturesInPage(descriptor) {
             }
         }
         
-        for (let attempt = 0; attempt < 2; attempt++) {
+        async function translateTextToEnglish(text, { allowRetry = true } = {}) {
+            if (!needsTranslation || !text) {
+                return text;
+            }
+            const clipped = String(text || '').trim().slice(0, 1600);
+            if (!clipped) {
+                return text;
+            }
+            const attempts = allowRetry ? 2 : 1;
+            for (let attempt = 0; attempt < attempts; attempt += 1) {
+                const forceReset = attempt > 0;
+                try {
+                    const session = await getSession(forceReset);
+                    const prompt = `
+Translate the following ${sourceLanguage} text into natural English.
+Return ONLY JSON:
+{"translation":"..."}
+
+Text:
+"""${clipped}"""
+                    `.trim();
+                    const raw = await session.prompt(prompt);
+                    const parsed = parseJsonResponse(raw);
+                    if (parsed && typeof parsed.translation === 'string') {
+                        const translated = parsed.translation.trim();
+                        if (translated) {
+                            return translated;
+                        }
+                    }
+                } catch (error) {
+                    const message = error?.message || '';
+                    if (allowRetry && attempt === 0 && recoverablePattern.test(message)) {
+                        scope.__aitabLanguageSessionPromise = null;
+                        continue;
+                    }
+                    console.warn('translateTextToEnglish failed:', error);
+                }
+            }
+            return text;
+        }
+        
+        async function translateListToEnglish(items) {
+            if (!needsTranslation || !Array.isArray(items) || items.length === 0) {
+                return items;
+            }
+            const rows = items
+                .map((item, index) => `${index + 1}. ${String(item || '').trim()}`)
+                .filter(line => line.length > 0)
+                .join('\n');
+            if (!rows) {
+                return items;
+            }
+            for (let attempt = 0; attempt < 2; attempt += 1) {
+                const forceReset = attempt > 0;
+                try {
+                    const session = await getSession(forceReset);
+                    const prompt = `
+Translate the following ${sourceLanguage} bullet points to English. Preserve the ordering.
+Return ONLY JSON: {"translations":["...","..."]}
+
+Items:
+${rows}
+                    `.trim();
+                    const raw = await session.prompt(prompt);
+                    const parsed = parseJsonResponse(raw);
+                    if (parsed && Array.isArray(parsed.translations) && parsed.translations.length) {
+                        const translations = parsed.translations
+                            .map(item => String(item || '').trim())
+                            .filter(Boolean);
+                        if (translations.length) {
+                            return translations;
+                        }
+                    }
+                } catch (error) {
+                    const message = error?.message || '';
+                    if (attempt === 0 && recoverablePattern.test(message)) {
+                        scope.__aitabLanguageSessionPromise = null;
+                        continue;
+                    }
+                    console.warn('translateListToEnglish failed:', error);
+                }
+            }
+            return items;
+        }
+        
+        const summaryInput = buildSummaryInput(descriptor);
+        let summaryPoints = Array.isArray(descriptor.summaryBullets)
+            ? descriptor.summaryBullets.map(item => String(item || '').trim()).filter(Boolean).slice(0, 6)
+            : [];
+        let summarizerStatus = 'skipped';
+        
+        if (!summaryPoints.length && summaryInput) {
+            try {
+                const summarizer = await getSummarizer(false);
+                if (summarizer) {
+                    const summary = await summarizer.summarize(summaryInput);
+                    summaryPoints = parseSummarizerOutput(summary);
+                    summarizerStatus = 'success';
+                } else {
+                    summarizerStatus = 'unavailable';
+                }
+            } catch (error) {
+                summarizerStatus = error?.aiStatus || 'error';
+                console.warn('generateTabFeaturesInPage summarizer error:', error);
+            }
+        }
+        
+        if (!summaryPoints.length) {
+            summaryPoints = fallbackSummary(descriptor);
+            summarizerStatus = summarizerStatus === 'success' ? 'success' : 'fallback';
+        }
+        if (!summaryPoints.length && summaryInput) {
+            summaryPoints = [summaryInput.slice(0, 200)];
+        }
+        if (needsTranslation && summaryPoints.length) {
+            try {
+                const translatedSummary = await translateListToEnglish(summaryPoints);
+                if (Array.isArray(translatedSummary) && translatedSummary.length) {
+                    summaryPoints = translatedSummary;
+                }
+            } catch (translationError) {
+                console.warn('Summary translation failed:', translationError);
+            }
+        }
+        summaryPoints = summaryPoints.map(point => point.slice(0, 260));
+        
+        if (needsTranslation) {
+            if (descriptor.title) {
+                descriptor.title = await translateTextToEnglish(descriptor.title);
+            }
+            if (descriptor.metaDescription) {
+                descriptor.metaDescription = await translateTextToEnglish(descriptor.metaDescription, { allowRetry: false });
+            }
+            if (Array.isArray(descriptor.headings) && descriptor.headings.length) {
+                const translatedHeadings = await translateListToEnglish(descriptor.headings);
+                if (Array.isArray(translatedHeadings) && translatedHeadings.length) {
+                    descriptor.headings = translatedHeadings.slice(0, descriptor.headings.length);
+                }
+            }
+            if (descriptor.topicHints) {
+                descriptor.topicHints = await translateTextToEnglish(descriptor.topicHints, { allowRetry: false });
+            }
+            if (descriptor.content) {
+                descriptor.content = await translateTextToEnglish(descriptor.content, { allowRetry: false });
+            }
+            if (descriptor.youtube) {
+                if (descriptor.youtube.topic) {
+                    descriptor.youtube.topic = await translateTextToEnglish(descriptor.youtube.topic, { allowRetry: false });
+                }
+                if (Array.isArray(descriptor.youtube.tags) && descriptor.youtube.tags.length) {
+                    const translatedTags = await translateListToEnglish(descriptor.youtube.tags);
+                    if (Array.isArray(translatedTags) && translatedTags.length) {
+                        descriptor.youtube.tags = translatedTags.slice(0, descriptor.youtube.tags.length);
+                    }
+                }
+                if (descriptor.youtube.description) {
+                    descriptor.youtube.description = await translateTextToEnglish(descriptor.youtube.description, { allowRetry: false });
+                }
+            }
+            descriptor.language = targetLanguage;
+            descriptor.translation = {
+                sourceLanguage
+            };
+        }
+        
+        const bannedMergeWords = Array.from(GENERIC_MERGE_STOPWORDS);
+        const allowedDocTypes = new Set(['article', 'category', 'landing', 'portal', 'docs']);
+        
+        for (let attempt = 0; attempt < 2; attempt += 1) {
             const forceReset = attempt > 0;
             try {
                 const session = await getSession(forceReset);
-                
-                const parts = [
-                    `TITLE: ${descriptor.title}`,
-                    `URL: ${descriptor.url}`,
-                    `DOMAIN: ${descriptor.domain}`,
-                    `META: ${descriptor.metaDescription || '—'}`,
-                    `LANGUAGE: ${descriptor.language || 'unknown'}`,
-                    `HEADINGS: ${(descriptor.headings || []).slice(0, 5).join(' | ') || '—'}`,
-                    `META KEYWORDS: ${(descriptor.metaKeywords || []).join(', ') || '—'}`,
-                    `HINTS: ${descriptor.topicHints || '—'}`,
-                    `CONTENT: ${(descriptor.content || '').slice(0, 1200)}`
-                ];
-                
-                if (descriptor.youtube) {
-                    parts.push(
-                        `YOUTUBE TOPIC: ${descriptor.youtube.topic || '—'}`,
-                        `YOUTUBE TAGS: ${(descriptor.youtube.tags || []).join(', ')}`,
-                        `CHANNEL: ${descriptor.youtube.channel || '—'}`,
-                        `YOUTUBE SUMMARY: ${(descriptor.youtube.summaryBullets || []).join(' | ')}`,
-                        `YOUTUBE DESCRIPTION: ${(descriptor.youtube.description || '').slice(0, 1200)}`
-                    );
-                }
-                
-                const prompt = `
-You are an AI that extracts semantic features from browser tabs. 
-DO NOT GROUP. DO NOT CLASSIFY INTO FIXED CATEGORIES.
-
-Given the tab TITLE and CONTENT SUMMARY, return STRICT JSON with:
-{
-  "topic": "<2-4 word description of the core theme>",
-  "keywords": ["k1","k2","k3","k4","k5"]
-}
-
-Rules:
-- Be concise and factual
-- Use ONLY information from the tab
-- No creative guesses
-- No emojis
-- The "topic" must describe the subject, not the category (e.g. "iPhone camera reviews", not "Technology")
-- Keywords must be lowercase
-- JSON only, no text outside the object
-
-TAB DATA:
-${parts.join('\n')}
-            `.trim();
-            
-                console.log('🧠 [TabFeatures] Prompt preview:', prompt.substring(0, 600));
-                
+                const prompt = buildClassificationPrompt(summaryPoints, descriptor, summarizerStatus);
                 const raw = await session.prompt(prompt);
-                console.log('🧠 [TabFeatures] Raw response type/length:', typeof raw, raw?.length ?? 'n/a');
+                const parsed = parseJsonResponse(raw);
                 
-                const match = typeof raw === 'string'
-                    ? raw.match(/\{[\s\S]*\}/)
-                    : null;
-                let parsed;
-                try {
-                    parsed = match ? JSON.parse(match[0]) : JSON.parse(String(raw));
-                } catch (parseError) {
-                    console.warn('🧠 [TabFeatures] Failed to parse response:', parseError, 'raw:', raw);
-                    throw new Error('Invalid JSON response from language model');
+                const primaryTopicRaw = String(parsed.primary_topic || '').trim();
+                if (!primaryTopicRaw) {
+                    throw new Error('Missing primary_topic in response');
                 }
                 
-                const topic = String(parsed.topic || '').trim();
-                const keywords = sanitizeKeywords(parsed.keywords || []);
-                
-                if (!topic) {
-                    throw new Error('No topic returned by language model');
+                let mergeHints = sanitizeList(parsed.merge_hints || [], {
+                    limit: 6,
+                    toLower: true,
+                    minLength: 3,
+                    banned: bannedMergeWords
+                });
+                if (mergeHints.length < 2) {
+                    mergeHints = sanitizeList(primaryTopicRaw.split(/[^\p{L}\p{N}]+/u), {
+                        limit: 6,
+                        toLower: true,
+                        minLength: 3,
+                        banned: bannedMergeWords
+                    });
                 }
+                if (mergeHints.length < 2 && summaryPoints.length) {
+                    const summaryTokens = sanitizeList(
+                        summaryPoints.join(' ').split(/[^\p{L}\p{N}]+/u),
+                        {
+                            limit: 6,
+                            toLower: true,
+                            minLength: 3,
+                            banned: bannedMergeWords
+                        }
+                    );
+                    const merged = [];
+                    for (const token of [...mergeHints, ...summaryTokens]) {
+                        if (!merged.includes(token)) {
+                            merged.push(token);
+                        }
+                        if (merged.length >= 6) break;
+                    }
+                    mergeHints = merged;
+                }
+                if (mergeHints.length < 2) {
+                    mergeHints = ['general', 'browsing'];
+                }
+                
+                const subtopics = sanitizeList(parsed.subtopics || [], {
+                    limit: 6,
+                    toLower: true,
+                    minLength: 3,
+                    banned: []
+                });
+                const entitiesRaw = sanitizeList(parsed.entities || [], {
+                    limit: 6,
+                    toLower: false,
+                    minLength: 2,
+                    banned: []
+                });
+                const entities = entitiesRaw.map(entity =>
+                    entity
+                        .split(/\s+/)
+                        .filter(Boolean)
+                        .map(token => token.charAt(0).toUpperCase() + token.slice(1))
+                        .join(' ')
+                );
+                
+                let docType = String(parsed.doc_type || 'article').toLowerCase();
+                if (!allowedDocTypes.has(docType)) {
+                    docType = 'article';
+                }
+                const isGenericLanding = Boolean(parsed.is_generic_landing);
+                
+                const topicLabel = primaryTopicRaw
+                    .split(/\s+/)
+                    .map(token => token.charAt(0).toUpperCase() + token.slice(1))
+                    .join(' ')
+                    .trim();
                 
                 return {
                     ok: true,
-                    topic,
-                    keywords
+                    primaryTopic: primaryTopicRaw.toLowerCase(),
+                    topicLabel: topicLabel || primaryTopicRaw,
+                    mergeHints,
+                    subtopics,
+                    entities,
+                    docType,
+                    isGenericLanding,
+                    summary: summaryPoints,
+                    summarizerStatus,
+                    sourceLanguage,
+                    normalizedLanguage: targetLanguage
                 };
             } catch (error) {
                 const message = error?.message || String(error);
@@ -3337,7 +5279,7 @@ ${parts.join('\n')}
                 };
             }
         }
-
+        
         return {
             ok: false,
             error: 'Language model unavailable after retries',
@@ -3480,6 +5422,8 @@ function generateGroupLabelInPage(descriptor) {
         );
     }
     
+    const labelLanguage = 'en';
+    
     return (async () => {
         const scope = typeof self !== 'undefined' ? self : (typeof window !== 'undefined' ? window : globalThis);
         const languageModelApi = resolveLanguageModelApi();
@@ -3532,6 +5476,7 @@ function generateGroupLabelInPage(descriptor) {
                     
                     try {
                         return await languageModelApi.create({
+                            language: labelLanguage,
                             monitor(monitor) {
                                 monitor.addEventListener('downloadprogress', (event) => {
                                     console.log(`Group label language model download ${(event.loaded * 100).toFixed(1)}%`);
@@ -3540,7 +5485,7 @@ function generateGroupLabelInPage(descriptor) {
                         });
                     } catch (error) {
                         console.warn('LanguageModel.create with monitor failed, retrying without monitor:', error);
-                        return await languageModelApi.create();
+                        return await languageModelApi.create({ language: labelLanguage });
                     }
                 })();
             }
@@ -3564,24 +5509,36 @@ function generateGroupLabelInPage(descriptor) {
                 
                 const centroidLine = (descriptor.centroidKeywords || []).join(', ') || 'none';
                 const fallbackLine = (descriptor.fallbackKeywords || []).join(', ') || 'none';
+                const primaryTopicLine = descriptor.primaryTopic || 'unknown';
+                const docTypeLine = descriptor.docType || 'unknown';
+                const mergeHintsLine = (descriptor.mergeHints || []).join(', ') || 'none';
+                const entitiesLine = (descriptor.entities || []).join(', ') || 'none';
+                const genericRatioLine = typeof descriptor.genericLandingRatio === 'number'
+                    ? descriptor.genericLandingRatio.toFixed(2)
+                    : '0.00';
                 const tabLines = (descriptor.exemplarTabs || []).map((tab, idx) => `
 TAB ${idx + 1}
 - Title: ${tab.title}
 - Topic: ${tab.topic}
-- Keywords: ${(tab.keywords || []).join(', ')}
+- Primary topic: ${tab.primaryTopic || tab.topic || 'unknown'}
+- Merge hints: ${(tab.mergeHints || []).join(', ') || '—'}
+- Doc type: ${tab.docType || 'unknown'}
+- Entities: ${(tab.entities || []).join(', ') || '—'}
+- Keywords: ${(tab.keywords || []).join(', ') || '—'}
 - Domain: ${tab.domain || 'unknown'}
                 `.trim()).join('\n\n') || 'No exemplar tabs provided.';
                 
                 const taxonomyLine = (descriptor.taxonomyTags || []).join(', ') || 'none';
                 const prompt = `
-You generate concise labels for groups of browser tabs.
-Return STRICT JSON: {"label":"<2-4 word title>"}
+You generate concise labels and one-line blurbs for groups of browser tabs.
+Return STRICT JSON: {"label":"<2-4 word title>","blurb":"<6-12 word one-liner>"}
 
 Rules:
-- Use at most 4 words
-- Be specific to the shared subject
-- No emojis, no punctuation beyond spaces
-- Do not repeat the same word more than once
+- Label must use at most 4 words
+- Be specific to the shared subject and respond in English
+- No emojis, no punctuation beyond spaces inside the label
+- Blurb must be in English, 6-12 words, no emojis, no quotes, no trailing punctuation
+- Do not repeat the same word more than once in the label
 - Base only on topics/keywords provided
 
 Group information:
@@ -3590,6 +5547,11 @@ Additional keywords: ${fallbackLine}
 Taxonomy hints: ${taxonomyLine}
 Dominant domain: ${descriptor.domainMode || 'unknown'}
 Dominant language: ${descriptor.languageMode || 'unknown'}
+Primary topic consensus: ${primaryTopicLine}
+Doc type tendency: ${docTypeLine}
+Merge hints: ${mergeHintsLine}
+Notable entities: ${entitiesLine}
+Generic landing ratio (0-1): ${genericRatioLine}
 
 Representative tabs:
 ${tabLines}
@@ -3614,10 +5576,12 @@ ${tabLines}
                 if (!label) {
                     throw new Error('No label returned');
                 }
+                const blurb = String(parsed.blurb || '').trim().slice(0, 160);
                 
                 return {
                     ok: true,
-                    label
+                    label,
+                    blurb
                 };
             } catch (error) {
                 const message = error?.message || String(error);
@@ -3642,6 +5606,219 @@ ${tabLines}
             status: 'unavailable'
         };
     })();
+}
+
+function normalizePredictedGroupMap(predictedGroups) {
+    if (predictedGroups instanceof Map) {
+        return predictedGroups;
+    }
+    if (predictedGroups && typeof predictedGroups === 'object') {
+        const map = new Map();
+        Object.entries(predictedGroups).forEach(([key, value]) => {
+            map.set(key, value);
+        });
+        return map;
+    }
+    return new Map();
+}
+
+function buildPredictedGroupMap(groups, tabData) {
+    const map = new Map();
+    if (Array.isArray(groups)) {
+        groups.forEach((group, index) => {
+            const groupId = group?.id || group?.name || `G${index}`;
+            (group?.tabIndices || []).forEach(tabIdx => {
+                const tab = tabData?.[tabIdx];
+                if (tab?.url) {
+                    map.set(tab.url, groupId);
+                }
+            });
+        });
+    }
+    if (Array.isArray(tabData)) {
+        tabData.forEach((tab, index) => {
+            if (!tab?.url) return;
+            if (!map.has(tab.url)) {
+                map.set(tab.url, `singleton:${index}`);
+            }
+        });
+    }
+    return map;
+}
+
+function evalPairwise(tabs, predictedGroups) {
+    if (!Array.isArray(tabs) || !tabs.length) {
+        return { TP: 0, FP: 0, FN: 0, precision: 1, recall: 1, f1: 1, totalPairs: 0 };
+    }
+    const map = normalizePredictedGroupMap(predictedGroups);
+    const n = tabs.length;
+    let TP = 0;
+    let FP = 0;
+    let FN = 0;
+    for (let i = 0; i < n; i += 1) {
+        const goldI = tabs[i].gold;
+        const predI = map.get(tabs[i].url);
+        for (let j = i + 1; j < n; j += 1) {
+            const goldJ = tabs[j].gold;
+            const predJ = map.get(tabs[j].url);
+            const sameGold = goldI === goldJ;
+            const samePred = predI !== undefined && predI === predJ;
+            if (sameGold && samePred) {
+                TP += 1;
+            } else if (!sameGold && samePred) {
+                FP += 1;
+            } else if (sameGold && !samePred) {
+                FN += 1;
+            }
+        }
+    }
+    const totalPairs = (n * (n - 1)) / 2;
+    const precision = (TP + FP) === 0 ? 1 : TP / (TP + FP);
+    const recall = (TP + FN) === 0 ? 1 : TP / (TP + FN);
+    const f1 = (precision + recall) === 0 ? 0 : (2 * precision * recall) / (precision + recall);
+    return {
+        TP,
+        FP,
+        FN,
+        precision: Number(precision.toFixed(3)),
+        recall: Number(recall.toFixed(3)),
+        f1: Number(f1.toFixed(3)),
+        totalPairs
+    };
+}
+
+function evalBCubed(tabs, predictedGroups) {
+    if (!Array.isArray(tabs) || !tabs.length) {
+        return { precision: 1, recall: 1, f1: 1 };
+    }
+    const map = normalizePredictedGroupMap(predictedGroups);
+    const goldGroups = new Map();
+    const predGroups = new Map();
+    for (const tab of tabs) {
+        if (!tab?.url) continue;
+        const goldGroup = tab.gold;
+        const predGroup = map.get(tab.url);
+        if (!goldGroups.has(goldGroup)) {
+            goldGroups.set(goldGroup, []);
+        }
+        goldGroups.get(goldGroup).push(tab.url);
+        if (!predGroups.has(predGroup)) {
+            predGroups.set(predGroup, []);
+        }
+        predGroups.get(predGroup).push(tab.url);
+    }
+    const intersectionSize = (list, set) => {
+        let count = 0;
+        for (const item of list) {
+            if (set.has(item)) {
+                count += 1;
+            }
+        }
+        return count;
+    };
+    let precisionSum = 0;
+    let recallSum = 0;
+    tabs.forEach(tab => {
+        if (!tab?.url) return;
+        const goldList = goldGroups.get(tab.gold) || [];
+        const predList = predGroups.get(map.get(tab.url)) || [];
+        const predSet = new Set(predList);
+        const goldSet = new Set(goldList);
+        const inter = intersectionSize(predList, goldSet);
+        const precision = predList.length ? inter / predList.length : 0;
+        const recall = goldList.length ? inter / goldList.length : 0;
+        precisionSum += precision;
+        recallSum += recall;
+    });
+    const precision = precisionSum / tabs.length;
+    const recall = recallSum / tabs.length;
+    const f1 = (precision + recall) === 0 ? 0 : (2 * precision * recall) / (precision + recall);
+    return {
+        precision: Number(precision.toFixed(3)),
+        recall: Number(recall.toFixed(3)),
+        f1: Number(f1.toFixed(3))
+    };
+}
+
+function computePurityByCluster(tabs, predictedGroups) {
+    const map = normalizePredictedGroupMap(predictedGroups);
+    const clusters = new Map();
+    tabs.forEach(tab => {
+        if (!tab?.url) return;
+        const groupId = map.get(tab.url);
+        if (!clusters.has(groupId)) {
+            clusters.set(groupId, []);
+        }
+        clusters.get(groupId).push(tab.gold);
+    });
+    const result = [];
+    clusters.forEach((labels, groupId) => {
+        const frequency = new Map();
+        labels.forEach(label => {
+            frequency.set(label, (frequency.get(label) || 0) + 1);
+        });
+        const [majorityLabel, majorityCount] = Array.from(frequency.entries()).sort((a, b) => b[1] - a[1])[0] || ['', 0];
+        const purity = labels.length ? majorityCount / labels.length : 0;
+        result.push({
+            groupId,
+            size: labels.length,
+            majorityLabel,
+            purity: Number(purity.toFixed(3))
+        });
+    });
+    result.sort((a, b) => b.size - a.size);
+    return result;
+}
+
+async function runGoldenEvaluation(scenario, { groups = aiGroups, tabData = currentTabData } = {}) {
+    if (!scenario || !Array.isArray(scenario.tabs)) {
+        const error = new Error('Invalid golden scenario format');
+        error.details = scenario;
+        throw error;
+    }
+    if (!Array.isArray(groups) || !groups.length) {
+        throw new Error('No predicted groups available. Run a scan before evaluating.');
+    }
+    const predictedMap = buildPredictedGroupMap(groups, tabData);
+    if (!predictedMap.size) {
+        throw new Error('Failed to build predicted group mapping.');
+    }
+    const tabsForEval = [];
+    const missingPredictions = [];
+    scenario.tabs.forEach((tab, index) => {
+        if (!tab || !tab.url || typeof tab.gold === 'undefined') {
+            return;
+        }
+        if (!predictedMap.has(tab.url)) {
+            missingPredictions.push(tab.url);
+            predictedMap.set(tab.url, `missing:${index}`);
+        }
+        tabsForEval.push({ url: tab.url, gold: tab.gold });
+    });
+    if (!tabsForEval.length) {
+        throw new Error('Golden scenario contains no valid tabs.');
+    }
+    const pairwise = evalPairwise(tabsForEval, predictedMap);
+    const bcubed = evalBCubed(tabsForEval, predictedMap);
+    const denominator = pairwise.TP + pairwise.FP + pairwise.FN;
+    const overMergeRate = denominator ? Number((pairwise.FP / denominator).toFixed(3)) : 0;
+    const underClusterRate = denominator ? Number((pairwise.FN / denominator).toFixed(3)) : 0;
+    const purityByCluster = computePurityByCluster(tabsForEval, predictedMap);
+    const result = {
+        scenarioName: scenario.name || 'unnamed',
+        notes: scenario.notes || '',
+        pairwise,
+        bcubed,
+        overMergeRate,
+        underClusterRate,
+        purityByCluster,
+        missingPredictions,
+        tabCount: tabsForEval.length,
+        timestamp: Date.now()
+    };
+    lastGoldenEvaluation = result;
+    console.log('📊 Golden evaluation result:', result);
+    return result;
 }
 
 /**
@@ -3925,6 +6102,10 @@ ${(ctx.transcript || '').slice(0, 6000)}
         
         if (languageModelApi) {
             const recoverableLanguagePattern = /(destroyed|closed|reset|disconnected|terminated)/i;
+            const ytLanguage = (() => {
+                const candidate = ctx.language || (typeof navigator !== 'undefined' ? navigator.language : '') || 'en';
+                return String(candidate).split('-')[0] || 'en';
+            })();
             
             async function getLanguageSession(forceReset = false) {
                 if (forceReset) {
@@ -3944,6 +6125,7 @@ ${(ctx.transcript || '').slice(0, 6000)}
                         
                         try {
                             return await languageModelApi.create({
+                                language: ytLanguage,
                                 monitor(monitor) {
                                     monitor.addEventListener('downloadprogress', (event) => {
                                         console.log(`YouTube language model download progress ${(event.loaded * 100).toFixed(1)}%`);
@@ -3952,7 +6134,7 @@ ${(ctx.transcript || '').slice(0, 6000)}
                             });
                         } catch (monitorError) {
                             console.warn('LanguageModel.create with monitor failed, retrying:', monitorError);
-                            return await languageModelApi.create();
+                            return await languageModelApi.create({ language: ytLanguage });
                         }
                     })();
                 }
@@ -4466,9 +6648,14 @@ async function performAIGroupingInContent(tabData) {
             }
         }
         
+        const sessionLanguage = (() => {
+            const candidate = tabData?.[0]?.language || (typeof navigator !== 'undefined' ? navigator.language : '') || 'en';
+            return String(candidate).split('-')[0] || 'en';
+        })();
         let session;
         try {
             session = await languageModelApi.create({
+                language: sessionLanguage,
                 monitor(monitor) {
                     monitor.addEventListener('downloadprogress', (event) => {
                         const percent = (event.loaded * 100).toFixed(1);
@@ -4478,7 +6665,7 @@ async function performAIGroupingInContent(tabData) {
             });
         } catch (createWithMonitorError) {
             console.warn('Content script: LanguageModel.create with monitor failed, retrying without options:', createWithMonitorError);
-            session = await languageModelApi.create();
+            session = await languageModelApi.create({ language: sessionLanguage });
         }
         
         if (!session) {
@@ -4608,6 +6795,11 @@ if (typeof module !== 'undefined' && module.exports) {
         parseSummarizerResponse,
         parseSummaryResponse,
         performAIGroupingInContent,
-        performAISummarizationInContent
+        performAISummarizationInContent,
+        evalPairwise,
+        evalBCubed,
+        computePurityByCluster,
+        runGoldenEvaluation,
+        buildPredictedGroupMap
     };
 }
