@@ -10,12 +10,10 @@
     "windows",
     "scripting", 
     "activeTab",
-    "storage",
-    "declarativeContent"
+    "storage"
   ],
   
   "host_permissions": [
-    "<all_urls>",
     "http://*/*",
     "https://*/*"
   ],

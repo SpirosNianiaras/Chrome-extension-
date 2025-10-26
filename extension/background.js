@@ -2073,25 +2073,19 @@ function createShardPrompt(shardTabs) {
     const tabsInfo = shardTabs.map((tab, index) => {
         const cleanTitle = tab.title || 'Untitled';
         const cleanUrl = tab.url || '';
-        const domain = cleanUrl ? new URL(cleanUrl).hostname.replace('www.', '') : '';
-        return `${index}: "${cleanTitle}" [${domain}] - ${cleanUrl}`;
+        return `${index}: "${cleanTitle}" - ${cleanUrl}`;
     }).join('\n');
     
-    return `Analyze these browser tabs and generate 3-5 keywords per tab describing their main topic/purpose.
-Pay attention to both titles AND URLs to infer topics.
-
+    return `Analyze these tabs and generate 3-5 keywords per tab describing their main topic/purpose.
 Return ONLY valid JSON in this format: {"keywords":[{"index":0,"keywords":["keyword1","keyword2"]}]}
 
 Tabs:
 ${tabsInfo}
 
 Requirements:
-- Return ONLY the JSON object (no markdown, no extra text)
-- Use clear, relevant keywords (1-2 words each)
-- Consider both title AND domain/URL context
-- Examples: medical sites → use "medical", "health", "research"
-- Examples: ai sites → use "ai", "artificial intelligence", "tech"
-- Examples: gaming sites → use "gaming", "game", "sports"
+- Return ONLY the JSON object
+- Use clear, relevant keywords
+- Keywords should be 1-2 words
 - Focus on main topics, not technical details`;
 }
 
@@ -2123,18 +2117,9 @@ async function executeAIGroupingWithTimeout(prompt, timeout) {
         
         console.log('🤖 [AI] Using executeScript on tab:', usableTab.id, usableTab.url);
         
-        console.log('🤖 [AI] Attempting to inject and execute AI grouping...');
+        console.log('🤖 [AI] Attempting to execute AI grouping...');
         
-        // First, inject content script if needed
-        try {
-            await chrome.scripting.executeScript({
-                target: { tabId: usableTab.id },
-                files: ['content.js']
-            });
-            console.log('🤖 [AI] Content script injected');
-        } catch (err) {
-            console.warn('🤖 [AI] Content script already injected or injection failed:', err.message);
-        }
+        // Content script is already loaded automatically via manifest
         
         const results = await chrome.scripting.executeScript({
             target: { tabId: usableTab.id },
