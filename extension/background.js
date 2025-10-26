@@ -703,9 +703,9 @@ async function handleScanTabs(sendResponse) {
         
         // Αποθήκευση βασικών πληροφοριών tabs
         const basicTabData = validTabs.map(tab => ({
-            id: tab.id,
+                id: tab.id,
             title: tab.title,
-            url: tab.url,
+                url: tab.url,
             favicon: tab.favIconUrl,
             active: tab.active,
             lastAccessed: tab.lastAccessed
@@ -1125,8 +1125,8 @@ function handleTabDataExtracted(data, sendResponse) {
             try {
                 return updated.url ? new URL(updated.url).hostname : '';
             } catch (error) {
-                return '';
-            }
+        return '';
+    }
         })();
         updated.domain = domain;
         updated.topicHints = generateTopicHints(updated);
@@ -1946,11 +1946,15 @@ async function performAIEnsembleFusion(deterministicGroups, tabDataForAI) {
         console.log('🤖 [AI Suggestions] AI suggested these tab groupings:');
         const suggestionsArray = Array.from(aiSuggestions.entries());
         suggestionsArray.forEach(([tabIndex, groupInfo], index) => {
-            console.log(`🤖 [AI Suggestion ${index}] Tab ${tabIndex} → Group "${groupInfo.name}" (confidence: ${groupInfo.confidence})`);
+            console.log(`🤖 [AI Suggestion ${index}] Tab ${tabIndex} → Keywords: [${groupInfo.keywords?.join(', ') || 'none'}]`);
         });
     } else {
-        console.log('🤖 [AI Suggestions] No AI suggestions found');
+        console.log('⚠️ [AI Suggestions] No AI keywords found - will use fallback keywords');
     }
+    
+    // ✅ SIGNAL: AI Response Complete - Proceed with Scoring
+    console.log('✅ [AI Complete] AI processing finished, starting fusion scoring now...');
+    console.log(`✅ [AI Complete] Got ${aiSuggestions.size} AI keyword sets ready for scoring`);
     
     // 3. Fusion scoring: combine deterministic + AI + taxonomy
     const fusionGroups = await performFusionScoring(
@@ -2005,7 +2009,7 @@ function createShardsFromGroups(groups, tabDataForAI, maxSize) {
 /**
  * Επεξεργάζεται ένα shard με AI
  */
-async function processShardWithAI(shard, tabDataForAI, timeout) {
+async function processShardWithAI(shard, tabDataForAI, timeout, retries = 2) {
     console.log(`🤖 [Stage 5] Processing shard with ${shard.tabIndices.length} tab indices`);
     const shardTabs = shard.tabIndices.map(index => tabDataForAI[index]).filter(Boolean);
     console.log(`🤖 [Stage 5] Shard tabs after filtering: ${shardTabs.length}`);
@@ -2028,26 +2032,38 @@ async function processShardWithAI(shard, tabDataForAI, timeout) {
         // return cached[cacheKey].result; // DISABLED
     }
     
-    try {
-        console.log(`🤖 [Stage 5] Executing AI grouping with timeout: ${timeout}ms`);
-        // Execute AI grouping with timeout
-        const result = await executeAIGroupingWithTimeout(prompt, timeout);
-        console.log(`🤖 [Stage 5] AI grouping completed, result:`, result);
-        
-        // Cache result (DISABLED for debugging)
-        // await chrome.storage.session.set({
-        //     [cacheKey]: {
-        //         result,
-        //         timestamp: Date.now()
-        //     }
-        // });
-        
-        return result;
-    } catch (error) {
-        console.warn(`🤖 [Stage 5] AI grouping failed for shard:`, error.message);
-        console.warn(`🤖 [Stage 5] Error details:`, error);
-        return null;
+    // Retry logic for AI grouping
+    for (let attempt = 0; attempt <= retries; attempt++) {
+        try {
+            console.log(`🤖 [Stage 5] Executing AI grouping with timeout: ${timeout}ms (attempt ${attempt + 1}/${retries + 1})`);
+            // Execute AI grouping with timeout
+            const result = await executeAIGroupingWithTimeout(prompt, timeout);
+            console.log(`🤖 [Stage 5] AI grouping completed, result:`, result);
+            
+            // Cache result (DISABLED for debugging)
+            // await chrome.storage.session.set({
+            //     [cacheKey]: {
+            //         result,
+            //         timestamp: Date.now()
+            //     }
+            // });
+            
+            return result;
+        } catch (error) {
+            console.warn(`🤖 [Stage 5] AI grouping failed for shard (attempt ${attempt + 1}):`, error.message);
+            console.warn(`🤖 [Stage 5] Error details:`, error);
+            
+            if (attempt < retries) {
+                console.log(`🤖 [Stage 5] Retrying in 500ms...`);
+                await new Promise(resolve => setTimeout(resolve, 500));
+            } else {
+                console.error(`🤖 [Stage 5] All ${retries + 1} attempts failed, returning null`);
+                return null;
+            }
+        }
     }
+    
+    return null;
 }
 
 /**
@@ -2055,13 +2071,22 @@ async function processShardWithAI(shard, tabDataForAI, timeout) {
  */
 function createShardPrompt(shardTabs) {
     const tabsInfo = shardTabs.map((tab, index) => {
-        return `${index}: "${tab.title}" - ${tab.url}`;
+        const cleanTitle = tab.title || 'Untitled';
+        const cleanUrl = tab.url || '';
+        return `${index}: "${cleanTitle}" - ${cleanUrl}`;
     }).join('\n');
     
-    return `For each tab, generate 3-5 keywords that describe its main theme/purpose. Return JSON: {"keywords":[{"index":0,"keywords":["keyword1","keyword2","keyword3"]}]}
+    return `Analyze these tabs and generate 3-5 keywords per tab describing their main topic/purpose.
+Return ONLY valid JSON in this format: {"keywords":[{"index":0,"keywords":["keyword1","keyword2"]}]}
 
 Tabs:
-${tabsInfo}`;
+${tabsInfo}
+
+Requirements:
+- Return ONLY the JSON object
+- Use clear, relevant keywords
+- Keywords should be 1-2 words
+- Focus on main topics, not technical details`;
 }
 
 /**
@@ -2189,7 +2214,7 @@ async function executeAIGroupingWithTimeout(prompt, timeout) {
                     const parsed = JSON.parse(aiResult);
                     console.log('🤖 [AI] Parsed AI result:', parsed);
                     return parsed;
-                } catch (error) {
+            } catch (error) {
                     console.warn('🤖 [AI] Failed to parse AI result as JSON:', error);
                     return { groups: [], confidence: 0.5 };
                 }
@@ -2226,8 +2251,12 @@ async function executeAIGroupingWithTimeout(prompt, timeout) {
         
     } catch (error) {
         console.warn('🤖 [AI] AI grouping failed:', error.message);
+        console.warn('🤖 [AI] Error type:', error.name);
+        console.warn('🤖 [AI] Error stack:', error.stack?.substring(0, 200));
         console.log('🤖🤖🤖 [AI CLUSTERING END] 🤖🤖🤖');
-        return { groups: [], confidence: 0.5 };
+        
+        // Return empty result with low confidence when AI fails
+        return { keywords: [], confidence: 0.1 };
     }
 }
 
@@ -2235,26 +2264,7 @@ async function executeAIGroupingWithTimeout(prompt, timeout) {
  * Εκτελεί fusion scoring
  */
 async function performFusionScoring(deterministicGroups, aiSuggestions, tabDataForAI, weights, joinThreshold, centroidThreshold) {
-    console.log('🤖 [Stage 5] Performing fusion scoring...');
-    console.log('🤖 [Fusion] Input groups:', deterministicGroups.map(g => ({
-        name: g.name,
-        tabCount: g.tabIndices.length,
-        keywords: g.keywords?.slice(0, 3)
-    })));
-    console.log('🤖 [Fusion] Weights:', weights);
-    console.log('🤖 [Fusion] Join threshold:', joinThreshold);
-    console.log('🤖 [Fusion] Centroid threshold:', centroidThreshold);
-    
-    // Λεπτομερές logging για τα AI suggestions στο fusion
-    if (aiSuggestions.size > 0) {
-        console.log('🤖 [Fusion] AI suggestions being used in fusion:');
-        const suggestionsArray = Array.from(aiSuggestions.entries());
-        suggestionsArray.forEach(([tabIndex, groupInfo]) => {
-            console.log(`🤖 [Fusion AI] Tab ${tabIndex} → "${groupInfo.name}" (confidence: ${groupInfo.confidence})`);
-        });
-    } else {
-        console.log('🤖 [Fusion] No AI suggestions available for fusion');
-    }
+    console.log('🎯 [Fusion Scoring] Starting fusion scoring calculation...');
     
     const fusionGroups = [...deterministicGroups];
     const processed = new Set();
@@ -2265,11 +2275,6 @@ async function performFusionScoring(deterministicGroups, aiSuggestions, tabDataF
             if (processed.has(`${i}-${j}`)) continue;
             
             const fusionScore = calculateFusionScore(i, j, aiSuggestions, tabDataForAI, weights);
-            
-            // Log all fusion scores for debugging
-            if (fusionScore > 0.1) { // Log scores above 0.1
-                console.log(`🔍 [Fusion] Score for tabs ${i}-${j}: ${fusionScore.toFixed(3)} (${tabDataForAI[i]?.title?.substring(0, 30)} + ${tabDataForAI[j]?.title?.substring(0, 30)})`);
-            }
             
             if (fusionScore >= joinThreshold) {
                 console.log(`🔗 [Fusion] High similarity detected: tabs ${i}-${j}, score: ${fusionScore.toFixed(3)} (threshold: ${joinThreshold})`);
@@ -2306,7 +2311,46 @@ async function performFusionScoring(deterministicGroups, aiSuggestions, tabDataF
 }
 
 /**
+ * Ελέγχει αν δύο tabs έχουν shared keywords (medical, research, technology, etc.)
+ */
+function checkSharedKeywords(tabI, tabJ) {
+    const medicalKeywords = ['medical', 'health', 'research', 'pubmed', 'nejm', 'clinical', 'treatment', 'patient', 'disease', 'journal', 'medicine', 'england', 'medicalnewstoday', 'ncbi', 'nih'];
+    const techKeywords = ['ai', 'artificial intelligence', 'tech', 'software', 'computer', 'digital', 'innovation', 'coding', 'development'];
+    const gamingKeywords = ['gaming', 'game', 'play', 'fifa', 'sport', 'team', 'fc', 'ultimate', 'player', 'ratings', 'squad'];
+    
+    const titleI = (tabI.title || '').toLowerCase();
+    const titleJ = (tabJ.title || '').toLowerCase();
+    const urlI = (tabI.url || '').toLowerCase();
+    const urlJ = (tabJ.url || '').toLowerCase();
+    
+    // Check if both titles have same category keywords
+    const categories = [
+        { keywords: medicalKeywords, name: 'medical' },
+        { keywords: techKeywords, name: 'tech' },
+        { keywords: gamingKeywords, name: 'gaming' }
+    ];
+    
+    for (const category of categories) {
+        const hasI = category.keywords.some(kw => titleI.includes(kw) || urlI.includes(kw));
+        const hasJ = category.keywords.some(kw => titleJ.includes(kw) || urlJ.includes(kw));
+        if (hasI && hasJ) {
+            return 1; // Both tabs share the same category
+        }
+    }
+    
+    return 0;
+}
+
+/**
  * Υπολογίζει fusion score για ένα ζεύγος
+ * Χρησιμοποιεί: Deterministic similarity + AI keywords + Taxonomy
+ * 
+ * AI Keyword Strategy (fallback system):
+ * 1. Αν και τα δύο tabs έχουν AI keywords → χρήση AI keywords
+ * 2. Αν μόνο ένα tab έχει AI keywords → συγκρίνει AI keywords με deterministic keywords
+ * 3. Αν κανένα tab δεν έχει AI keywords → χρήση deterministic keywords (fallback)
+ * 
+ * Έτσι το σύστημα λειτουργεί ακόμα και αν το AI δεν έχει ολοκληρώσει την επεξεργασία
  */
 function calculateFusionScore(i, j, aiSuggestions, tabDataForAI, weights) {
     const tabI = tabDataForAI[i];
@@ -2316,74 +2360,74 @@ function calculateFusionScore(i, j, aiSuggestions, tabDataForAI, weights) {
     const rawSimilarity = calculateTabSimilarity(tabI, tabJ);
     const detScore = rawSimilarity / 100; // Normalize to 0-1
     
-    // Log deterministic similarity for debugging
-    if (rawSimilarity > 10) { // Log similarities above 10
-        console.log(`🔍 [Det] Raw similarity for tabs ${i}-${j}: ${rawSimilarity.toFixed(1)} (${tabI.title?.substring(0, 30)} + ${tabJ.title?.substring(0, 30)})`);
-        
-        // Log keywords for debugging
-        const keywords1 = extractKeywordsFromText(tabI.title);
-        const keywords2 = extractKeywordsFromText(tabJ.title);
-        const commonKeywords = keywords1.filter(kw => keywords2.includes(kw));
-        console.log(`🔍 [Det] Keywords1: [${keywords1.slice(0, 5).join(', ')}]`);
-        console.log(`🔍 [Det] Keywords2: [${keywords2.slice(0, 5).join(', ')}]`);
-        console.log(`🔍 [Det] Common keywords: [${commonKeywords.join(', ')}]`);
-    }
-    
     // AI keyword similarity
     const aiI = aiSuggestions.get(i);
     const aiJ = aiSuggestions.get(j);
     let aiAgree = 0;
-    if (aiI && aiJ && aiI.keywords && aiJ.keywords) {
-        // Calculate keyword similarity
+    
+    if (aiI && aiJ && aiI.keywords && aiJ.keywords && aiI.keywords.length > 0 && aiJ.keywords.length > 0) {
+        // Both tabs have AI keywords - calculate similarity using AI keywords
         const keywords1 = new Set(aiI.keywords);
         const keywords2 = new Set(aiJ.keywords);
         const intersection = new Set([...keywords1].filter(x => keywords2.has(x)));
         const union = new Set([...keywords1, ...keywords2]);
         aiAgree = intersection.size / union.size; // Jaccard similarity
+    } else if (aiI && aiI.keywords && aiI.keywords.length > 0) {
+        // Only tab I has AI keywords - compare with deterministic keywords from tab J
+        const aiKeywords = new Set(aiI.keywords);
+        const titleKeywords = extractKeywordsFromText(tabJ.title);
+        const commonKeywords = titleKeywords.filter(kw => aiKeywords.has(kw));
+        const allKeywords = [...new Set([...Array.from(aiKeywords), ...titleKeywords])];
+        if (allKeywords.length > 0) {
+            aiAgree = commonKeywords.length / allKeywords.length;
+        }
+    } else if (aiJ && aiJ.keywords && aiJ.keywords.length > 0) {
+        // Only tab J has AI keywords - compare with deterministic keywords from tab I
+        const aiKeywords = new Set(aiJ.keywords);
+        const titleKeywords = extractKeywordsFromText(tabI.title);
+        const commonKeywords = titleKeywords.filter(kw => aiKeywords.has(kw));
+        const allKeywords = [...new Set([...Array.from(aiKeywords), ...titleKeywords])];
+        if (allKeywords.length > 0) {
+            aiAgree = commonKeywords.length / allKeywords.length;
+        }
+    } else {
+        // Neither tab has AI keywords - use deterministic keywords as fallback
+        const keywords1 = extractKeywordsFromText(tabI.title);
+        const keywords2 = extractKeywordsFromText(tabJ.title);
+        const commonKeywords = keywords1.filter(kw => keywords2.includes(kw));
+        const allKeywords = [...new Set([...keywords1, ...keywords2])];
+        
+        if (allKeywords.length > 0) {
+            aiAgree = commonKeywords.length / allKeywords.length; // Jaccard similarity
+        }
     }
     
     // Taxonomy agreement
     const taxI = tabI.primaryTopic || 'general';
     const taxJ = tabJ.primaryTopic || 'general';
-    const taxAgree = (taxI === taxJ && taxI !== 'general') ? 1 : 0;
+    let taxAgree = 0;
     
-    // Log taxonomy agreement for debugging
-    if (rawSimilarity > 10) {
-        console.log(`🔍 [Tax] Primary topics: "${taxI}" vs "${taxJ}" → Agreement: ${taxAgree}`);
+    // Check if tabs belong to same category (medical, technology, etc.)
+    if (taxI === taxJ && taxI !== 'general') {
+        taxAgree = 1;
+    } else if (taxI === 'general' && taxJ === 'general') {
+        // If both are general, check if they share domain-specific keywords
+        const sharedKeywords = checkSharedKeywords(tabI, tabJ);
+        if (sharedKeywords > 0) {
+            taxAgree = 0.3; // Boost for shared keywords even if both are general
+        }
     }
     
     // Calculate weighted score
     let score = weights.det * detScore + weights.ai * aiAgree + weights.tax * taxAgree;
     
-    // Log detailed score calculation
-    if (rawSimilarity > 10) {
-        console.log(`🔍 [Score Calc] Tab ${i}-${j} score breakdown:`);
-        console.log(`   📊 Deterministic: ${detScore.toFixed(3)} × ${weights.det} = ${(weights.det * detScore).toFixed(3)}`);
-        console.log(`   🤖 AI Agreement: ${aiAgree} × ${weights.ai} = ${(weights.ai * aiAgree).toFixed(3)}`);
-        console.log(`   🏷️ Taxonomy: ${taxAgree} × ${weights.tax} = ${(weights.tax * taxAgree).toFixed(3)}`);
-        console.log(`   ➕ Base score: ${score.toFixed(3)}`);
-    }
-    
     // Apply penalties
-    let penaltyTotal = 0;
     if (isGenericTab(tabI) || isGenericTab(tabJ)) {
         score -= 0.20; // Generic penalty
-        penaltyTotal += 0.20;
-        if (rawSimilarity > 10) {
-            console.log(`   ⚠️ Generic penalty: -0.20`);
-        }
     }
     
     if (isBridgeTab(tabI) || isBridgeTab(tabJ)) {
         score -= 0.05; // Bridge penalty
-        penaltyTotal += 0.05;
-        if (rawSimilarity > 10) {
-            console.log(`   ⚠️ Bridge penalty: -0.05`);
-        }
-    }
-    
-    if (rawSimilarity > 10) {
-        console.log(`   🎯 Final score: ${score.toFixed(3)} (penalties: -${penaltyTotal.toFixed(2)})`);
     }
     
     // Guard: ignore AI if deterministic score is too low
@@ -3054,13 +3098,13 @@ async function performAISummarization(groupContent) {
     try {
         // Βρίσκουμε ένα tab που μπορούμε να χρησιμοποιήσουμε για AI
         // Αποκλείουμε chrome:// URLs
-        const tabs = await chrome.tabs.query({});
+    const tabs = await chrome.tabs.query({});
         const accessibleTab = tabs.find(tab => 
-            tab.url && 
-            !tab.url.startsWith('chrome://') && 
-            !tab.url.startsWith('chrome-extension://') &&
+        tab.url &&
+        !tab.url.startsWith('chrome://') &&
+        !tab.url.startsWith('chrome-extension://') &&
             !tab.url.startsWith('moz-extension://') &&
-            !tab.url.startsWith('edge://') &&
+        !tab.url.startsWith('edge://') &&
             tab.url.startsWith('http')
         );
         
@@ -3352,9 +3396,9 @@ function generateTopicHints(tab) {
  */
 function calculateTabSimilarity(tab1, tab2) {
     try {
-        let score = 0;
-        let factors = 0;
-        
+    let score = 0;
+    let factors = 0;
+    
         // 🎯 TITLE & KEYWORDS SIMILARITY (50% weight) - ΠΙΟ ΣΗΜΑΝΤΙΚΟ!
         if (tab1.title && tab2.title) {
             const title1 = tab1.title.toLowerCase();
@@ -4305,7 +4349,7 @@ async function ensureTabEmbeddings(tabDataForAI) {
                         failureReasons.add(reason);
                     }
                 }
-            } catch (error) {
+    } catch (error) {
                 if (error?.message === 'AI embedding timeout') {
                     failureReasons.add('Embedding model timeout');
                     aiTabId = null;
@@ -5487,8 +5531,8 @@ function mergeSmallSimilarGroups(groups, vectors, similarityCache, { debugLog = 
     return Array.from(mergedMap.values()).map(entry => ({
         vectorIndices: Array.from(entry.vectorIndices).sort((a, b) => a - b),
         tabIndices: Array.from(entry.tabIndices).sort((a, b) => a - b)
-    }));
-}
+        }));
+    }
 
 function mergeYouTubeChannelSingletons(groups, vectors, tabData, { debugLog = null } = {}) {
     if (!Array.isArray(groups) || groups.length <= 1) {
@@ -6235,7 +6279,7 @@ async function processDeferredSummaries() {
                 if (result?.success) {
                     console.log(`✅ Deferred summary ready for group ${index} (${group.name}) [${result.source}]`);
                 }
-            } catch (error) {
+    } catch (error) {
                 console.warn(`⚠️ Deferred summary failed for group ${index}:`, error?.message || error);
             }
         }
@@ -6440,7 +6484,7 @@ ${makeSection('TAB B', tabB)}
                 confidence: typeof parsed.confidence === 'number' ? Math.max(0, Math.min(1, parsed.confidence)) : 0,
                 reason: String(parsed.reason || '').slice(0, 240)
             };
-        } catch (error) {
+    } catch (error) {
             console.error('judgeTabSimilarityInPage failed:', error);
             return {
                 ok: false,
@@ -6776,7 +6820,7 @@ ${metaLines.join('\n')}`.trim();
                                 });
                             }
                         });
-                    } catch (error) {
+        } catch (error) {
                         console.warn('LanguageModel.create with monitor failed, retrying without monitor:', error);
                         return await languageModelApi.create({ language: sessionLanguage });
                     }
@@ -7240,7 +7284,7 @@ function generateTabEmbeddingInPage(descriptor) {
                     }
                     
                     return { ok: true, embedding: Array.from(embeddingVector) };
-                } catch (error) {
+    } catch (error) {
                     const message = error?.message || String(error);
                     if (recoverablePattern.test(message) && attempt === 0) {
                         scope.__aitabEmbeddingSessionPromise = null;
@@ -7351,10 +7395,10 @@ function generateGroupLabelInPage(descriptor) {
                     throw new Error('Failed to create language model session');
                 }
                 return session;
-            } catch (error) {
+    } catch (error) {
                 scope.__aitabLanguageSessionPromise = null;
-                throw error;
-            }
+        throw error;
+    }
         }
         
         for (let attempt = 0; attempt < 2; attempt++) {
@@ -7929,12 +7973,12 @@ ${(ctx.transcript || '').slice(0, 6000)}
                         throw new Error('Failed to create summarizer session');
                     }
                     return summarizer;
-                } catch (error) {
+    } catch (error) {
                     scope.__aitabSummarizerPromise = null;
-                    throw error;
-                }
-            }
-            
+        throw error;
+    }
+}
+
             let summarizerSuccess = false;
             for (let attempt = 0; attempt < 2; attempt++) {
                 const forceReset = attempt > 0;
