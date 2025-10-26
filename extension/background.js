@@ -199,7 +199,7 @@ const TAXONOMY_RULES = [
 
 const HAS_PERFORMANCE_API = typeof performance !== 'undefined' && typeof performance.now === 'function';
 const AI_FEATURE_TIMEOUT = 18000;
-const AI_LABEL_TIMEOUT = 8000;
+const AI_LABEL_TIMEOUT = 15000;
 const AI_SUMMARY_TIMEOUT = 16000;
 function nowMs() {
     return HAS_PERFORMANCE_API ? performance.now() : Date.now();
@@ -493,6 +493,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             
         case 'EXPORT_SUMMARY':
             handleExportSummary(sendResponse);
+            return true;
+            
+        case 'CLEAR_CACHE':
+            clearCacheManually().then(result => {
+                sendResponse(result);
+            });
             return true;
         
         case 'REQUEST_GROUP_SUMMARY':
@@ -840,10 +846,10 @@ async function handleScanTabs(sendResponse) {
             const cachedResult = await chrome.storage.local.get([cacheKey]);
             
             if (cachedResult[cacheKey] && (Date.now() - cachedResult[cacheKey].timestamp) < 300000) { // 5 minutes cache
-                console.log('Using cached AI analysis results');
-                aiGroups = cachedResult[cacheKey].groups;
-                currentTabData = cachedResult[cacheKey].tabData;
-                scheduleDeferredSummaries(200);
+                console.log('CACHE DISABLED - forcing fresh AI analysis');
+                // aiGroups = cachedResult[cacheKey].groups;
+                // currentTabData = cachedResult[cacheKey].tabData;
+                // scheduleDeferredSummaries(200);
             } else {
                 try {
                     await performAIAnalysis();
@@ -1131,6 +1137,1376 @@ function handleTabDataExtracted(data, sendResponse) {
 }
 
 /**
+ * Stage 0: Smart Triage & Provisional Groups
+ * Αναλύει tabs με taxonomy + tokens + meta για να δημιουργήσει provisional groups
+ * και να καθορίσει ποια tabs χρειάζονται summarizer
+ */
+async function performSmartTriage(tabDataForAI) {
+    console.log('🎯 [Stage 0] Starting smart triage...');
+    
+    const triageResults = {
+        totalTabs: tabDataForAI.length,
+        needsSummarizer: [],
+        provisionalGroups: [],
+        avgConfidence: 0,
+        taxonomyMap: new Map(),
+        tokenMap: new Map()
+    };
+    
+    // 1. Fast taxonomy + token analysis για κάθε tab
+    for (const tab of tabDataForAI) {
+        const taxonomy = extractFastTaxonomy(tab);
+        const tokens = extractFastTokens(tab);
+        const confidence = calculateTriageConfidence(tab, taxonomy, tokens);
+        
+        triageResults.taxonomyMap.set(tab.index, taxonomy);
+        triageResults.tokenMap.set(tab.index, tokens);
+        
+        // Προσθήκη στη λίστα summarizer αν χρειάζεται
+        if (needsSummarizer(tab, taxonomy, tokens, confidence)) {
+            triageResults.needsSummarizer.push({
+                ...tab,
+                taxonomy,
+                tokens,
+                confidence,
+                priority: calculateSummarizerPriority(tab, taxonomy, tokens)
+            });
+        }
+    }
+    
+    // 2. Provisional grouping με βάση taxonomy + tokens
+    triageResults.provisionalGroups = createProvisionalGroups(tabDataForAI, triageResults.taxonomyMap, triageResults.tokenMap);
+    
+    // 3. Confidence calculation
+    const confidences = Array.from(triageResults.taxonomyMap.values()).map(t => t.confidence);
+    triageResults.avgConfidence = confidences.length > 0 ? confidences.reduce((a, b) => a + b, 0) / confidences.length : 0;
+    
+    // 4. Sort summarizer queue by priority
+    triageResults.needsSummarizer.sort((a, b) => b.priority - a.priority);
+    
+    console.log('🎯 [Stage 0] Triage analysis:', {
+        totalTabs: triageResults.totalTabs,
+        needsSummarizer: triageResults.needsSummarizer.length,
+        provisionalGroups: triageResults.provisionalGroups.length,
+        avgConfidence: Math.round(triageResults.avgConfidence * 100) / 100
+    });
+    
+    return triageResults;
+}
+
+/**
+ * Stage 1: Selective Summarization
+ * Εκτελεί summarization μόνο στα tabs που χρειάζονται, με budget/timeout/cache
+ */
+async function performSelectiveSummarization(needsSummarizer) {
+    console.log('📄 [Stage 1] Starting selective summarization...');
+    
+    const BUDGET_MS = 30000; // 30 second budget
+    const MAX_CONCURRENT = 3; // Max 3 concurrent summarizations
+    const CACHE_TTL = 10 * 60 * 1000; // 10 minutes cache
+    
+    const startTime = Date.now();
+    const results = [];
+    const activePromises = [];
+    
+    for (const tab of needsSummarizer) {
+        // Check budget
+        if (Date.now() - startTime > BUDGET_MS) {
+            console.log('📄 [Stage 1] Budget exceeded, stopping summarization');
+            break;
+        }
+        
+        // Check cache first
+        const cacheKey = `summarizer_${tab.contentHash || tab.url}`;
+        const cached = await chrome.storage.session.get([cacheKey]);
+        if (cached[cacheKey] && (Date.now() - cached[cacheKey].timestamp) < CACHE_TTL) {
+            console.log(`📄 [Stage 1] Using cached summary for: ${tab.title?.slice(0, 40)}`);
+            results.push({ ...tab, summary: cached[cacheKey].summary, cached: true });
+            continue;
+        }
+        
+        // Limit concurrent operations
+        if (activePromises.length >= MAX_CONCURRENT) {
+            await Promise.race(activePromises);
+        }
+        
+        // Start summarization
+        const promise = performTabSummarization(tab).then(summary => {
+            // Cache result
+            chrome.storage.session.set({
+                [cacheKey]: {
+                    summary,
+                    timestamp: Date.now()
+                }
+            });
+            return { ...tab, summary, cached: false };
+        }).catch(error => {
+            console.warn(`📄 [Stage 1] Summarization failed for ${tab.title?.slice(0, 40)}:`, error.message);
+            return { ...tab, summary: null, error: error.message };
+        });
+        
+        activePromises.push(promise);
+        results.push(promise);
+    }
+    
+    // Wait for all active operations
+    await Promise.all(activePromises);
+    
+    const finalResults = await Promise.all(results);
+    const successCount = finalResults.filter(r => r.summary && !r.error).length;
+    const cachedCount = finalResults.filter(r => r.cached).length;
+    
+    console.log('📄 [Stage 1] Selective summarization complete:', {
+        total: needsSummarizer.length,
+        processed: finalResults.length,
+        success: successCount,
+        cached: cachedCount,
+        failed: finalResults.length - successCount - cachedCount,
+        duration: Date.now() - startTime
+    });
+    
+    return finalResults;
+}
+
+/**
+ * Fast taxonomy extraction για triage
+ */
+function extractFastTaxonomy(tab) {
+    const domain = tab.domain || '';
+    const title = (tab.title || '').toLowerCase();
+    const url = tab.url || '';
+    
+    // Domain-based taxonomy - αφαιρέθηκαν S2 domains
+    let domainCategory = 'general';
+    if (domain.includes('pubmed') || domain.includes('nejm') || domain.includes('who.int')) {
+        domainCategory = 'medical';
+    } else if (domain.includes('techcrunch') || domain.includes('openai') || domain.includes('google')) {
+        domainCategory = 'technology';
+    } else if (domain.includes('steam') || domain.includes('epic') || domain.includes('playstation')) {
+        domainCategory = 'gaming';
+    } else if (domain.includes('shop') && !domain.includes('amazon') && !domain.includes('ebay') && 
+               !domain.includes('bestbuy') && !domain.includes('target')) {
+        domainCategory = 'shopping';
+    } else if (domain.includes('youtube') || domain.includes('netflix')) {
+        domainCategory = 'entertainment';
+    }
+    
+    // Title-based taxonomy - αφαιρέθηκαν S2 keywords
+    let titleCategory = 'general';
+    if (title.includes('medical') || title.includes('health') || title.includes('research')) {
+        titleCategory = 'medical';
+    } else if (title.includes('ai') || title.includes('artificial') || title.includes('tech')) {
+        titleCategory = 'technology';
+    } else if (title.includes('game') || title.includes('gaming')) {
+        // Αφαιρέθηκαν: fifa, fc, ultimate, team, squad, players, fut
+        titleCategory = 'gaming';
+    } else if (title.includes('buy') || title.includes('shop') || title.includes('price')) {
+        // Αφαιρέθηκαν: chair, laptop, accessories, sale, deals
+        titleCategory = 'shopping';
+    }
+    
+    // Confidence based on agreement
+    const confidence = domainCategory === titleCategory ? 0.8 : 0.5;
+    const finalCategory = confidence > 0.6 ? domainCategory : 'general';
+    
+    // Debug logging για να δούμε τι συμβαίνει
+    console.log(`🔍 [Taxonomy] Tab: "${title}" | Domain: ${domainCategory} | Title: ${titleCategory} | Final: ${finalCategory} | Confidence: ${confidence}`);
+    
+    return {
+        domain: domainCategory,
+        title: titleCategory,
+        final: finalCategory,
+        confidence,
+        keywords: extractKeywords(tab)
+    };
+}
+
+/**
+ * Fast token extraction για triage
+ */
+function extractFastTokens(tab) {
+    const text = `${tab.title || ''} ${tab.metaDescription || ''} ${tab.domain || ''}`.toLowerCase();
+    const tokens = text
+        .split(/[\s\-_.,;:!?()[\]{}"']+/)
+        .filter(token => token.length >= 3 && !STOPWORDS.has(token))
+        .slice(0, 20); // Limit for performance
+    
+    return {
+        tokens,
+        count: tokens.length,
+        unique: new Set(tokens).size
+    };
+}
+
+/**
+ * Υπολογίζει confidence για triage decision
+ */
+function calculateTriageConfidence(tab, taxonomy, tokens) {
+    let confidence = 0.5; // Base confidence
+    
+    // Boost confidence based on content length
+    if (tab.contentLength > 500) confidence += 0.2;
+    if (tab.contentLength > 1000) confidence += 0.1;
+    
+    // Boost confidence based on taxonomy agreement
+    if (taxonomy.confidence > 0.7) confidence += 0.2;
+    
+    // Boost confidence based on token richness
+    if (tokens.unique > 10) confidence += 0.1;
+    
+    return Math.min(confidence, 1.0);
+}
+
+/**
+ * Καθορίζει αν ένα tab χρειάζεται summarizer
+ */
+function needsSummarizer(tab, taxonomy, tokens, confidence) {
+    // Gaming-related tabs need summarizer for better grouping
+    const isGamingRelated = tab.title.toLowerCase().includes('gaming') || 
+                           tab.title.toLowerCase().includes('fifa') || 
+                           tab.title.toLowerCase().includes('ultimate') ||
+                           tab.domain.includes('ea.com') ||
+                           tab.domain.includes('futbin') ||
+                           tab.domain.includes('reddit') ||
+                           tab.domain.includes('amazon') ||
+                           tab.domain.includes('bestbuy') ||
+                           tab.domain.includes('target');
+    
+    if (isGamingRelated) return true;
+    
+    // High confidence tabs don't need summarizer
+    if (confidence > 0.8) return false;
+    
+    // Low content tabs don't need summarizer
+    if (tab.contentLength < 200) return false;
+    
+    // Generic/uncertain tabs need summarizer
+    if (taxonomy.final === 'general' && confidence < 0.6) return true;
+    
+    // Complex content needs summarizer
+    if (tokens.unique > 15 && tab.contentLength > 800) return true;
+    
+    return false;
+}
+
+/**
+ * Υπολογίζει priority για summarizer queue
+ */
+function calculateSummarizerPriority(tab, taxonomy, tokens) {
+    let priority = 0;
+    
+    // Higher priority for uncertain tabs
+    if (taxonomy.confidence < 0.5) priority += 10;
+    
+    // Higher priority for complex content
+    if (tokens.unique > 15) priority += 5;
+    if (tab.contentLength > 1000) priority += 5;
+    
+    // Higher priority for important domains
+    if (tab.domain.includes('pubmed') || tab.domain.includes('nejm')) priority += 8;
+    if (tab.domain.includes('techcrunch') || tab.domain.includes('openai')) priority += 6;
+    
+    return priority;
+}
+
+/**
+ * Δημιουργεί provisional groups με βάση taxonomy + tokens
+ */
+function createProvisionalGroups(tabDataForAI, taxonomyMap, tokenMap) {
+    const groups = [];
+    const processed = new Set();
+    
+    console.log('🔍 [Provisional Groups] Starting group creation for', tabDataForAI.length, 'tabs');
+    
+    for (let i = 0; i < tabDataForAI.length; i++) {
+        if (processed.has(i)) continue;
+        
+        const tab = tabDataForAI[i];
+        const taxonomy = taxonomyMap.get(i);
+        const tokens = tokenMap.get(i);
+        
+        const group = {
+            tabIndices: [i],
+            primaryTopic: taxonomy.final,
+            keywords: tokens.tokens.slice(0, 10),
+            confidence: taxonomy.confidence,
+            domain: tab.domain,
+            name: `${taxonomy.final.charAt(0).toUpperCase() + taxonomy.final.slice(1)} Group`
+        };
+        
+        console.log(`🔍 [Provisional Groups] Created group for tab ${i}: "${tab.title}" (${taxonomy.final})`);
+        
+        // Find similar tabs to merge
+        for (let j = i + 1; j < tabDataForAI.length; j++) {
+            if (processed.has(j)) continue;
+            
+            const otherTab = tabDataForAI[j];
+            const otherTaxonomy = taxonomyMap.get(j);
+            const otherTokens = tokenMap.get(j);
+            
+            if (shouldMergeProvisional(taxonomy, tokens, otherTaxonomy, otherTokens)) {
+                group.tabIndices.push(j);
+                processed.add(j);
+                
+                console.log(`🔗 [Provisional Groups] Merged tab ${j}: "${otherTab.title}" into group ${i}`);
+                
+                // Merge keywords
+                const allKeywords = [...group.keywords, ...otherTokens.tokens];
+                group.keywords = [...new Set(allKeywords)].slice(0, 10);
+                
+                // Update confidence
+                group.confidence = Math.max(group.confidence, otherTaxonomy.confidence);
+            }
+        }
+        
+        groups.push(group);
+        processed.add(i);
+    }
+    
+    console.log(`🔍 [Provisional Groups] Created ${groups.length} groups:`, groups.map(g => ({
+        tabCount: g.tabIndices.length,
+        topic: g.primaryTopic,
+        keywords: g.keywords.slice(0, 3)
+    })));
+    
+    return groups;
+}
+
+/**
+ * Καθορίζει αν δύο tabs πρέπει να ενωθούν σε provisional group
+ */
+function shouldMergeProvisional(taxonomy1, tokens1, taxonomy2, tokens2) {
+    // Same taxonomy category - πιο αυστηρή λογική
+    if (taxonomy1.final === taxonomy2.final && taxonomy1.final !== 'general') {
+        console.log(`🔗 [Merge] Same category merge: ${taxonomy1.final} (confidence: ${taxonomy1.confidence}, ${taxonomy2.confidence})`);
+        return true;
+    }
+    
+    // High token overlap - χαμηλότερο threshold
+    const overlap = calculateTokenOverlap(tokens1.tokens, tokens2.tokens);
+    if (overlap > 0.2) { // Μειώθηκε από 0.3 σε 0.2
+        console.log(`🔗 [Merge] High token overlap: ${(overlap * 100).toFixed(1)}%`);
+        return true;
+    }
+    
+    // Gaming-specific merge logic - αφαιρέθηκαν S2 keywords
+    if ((taxonomy1.final === 'gaming' || taxonomy2.final === 'gaming') && 
+        (taxonomy1.final === 'general' || taxonomy2.final === 'general')) {
+        const gamingTokens = ['gaming', 'game']; // Αφαιρέθηκαν: fc, fifa, ultimate, team, players, squad
+        const hasGamingTokens = gamingTokens.some(token => 
+            tokens1.tokens.includes(token) || tokens2.tokens.includes(token)
+        );
+        if (hasGamingTokens) {
+            console.log(`🔗 [Merge] Gaming-specific merge detected`);
+            return true;
+        }
+    }
+    
+    // Shopping-specific merge logic - αφαιρέθηκαν S2 keywords
+    if ((taxonomy1.final === 'shopping' || taxonomy2.final === 'shopping') && 
+        (taxonomy1.final === 'general' || taxonomy2.final === 'general')) {
+        const shoppingTokens = ['buy', 'shop', 'price']; // Αφαιρέθηκαν: chair, laptop, accessories, sale, deals
+        const hasShoppingTokens = shoppingTokens.some(token => 
+            tokens1.tokens.includes(token) || tokens2.tokens.includes(token)
+        );
+        if (hasShoppingTokens) {
+            console.log(`🔗 [Merge] Shopping-specific merge detected`);
+            return true;
+        }
+    }
+    
+    return false;
+}
+
+/**
+ * Υπολογίζει token overlap
+ */
+function calculateTokenOverlap(tokens1, tokens2) {
+    const set1 = new Set(tokens1);
+    const set2 = new Set(tokens2);
+    const intersection = new Set([...set1].filter(x => set2.has(x)));
+    const union = new Set([...set1, ...set2]);
+    
+    return union.size > 0 ? intersection.size / union.size : 0;
+}
+
+/**
+ * Εκτελεί summarization για ένα tab
+ */
+async function performTabSummarization(tab) {
+    // This will be implemented to use the existing summarizer logic
+    // but optimized for single tab processing
+    return null; // Placeholder
+}
+
+/**
+ * Extract keywords from tab data
+ */
+function extractKeywords(tab) {
+    const text = `${tab.title || ''} ${tab.metaDescription || ''} ${tab.domain || ''}`.toLowerCase();
+    return text
+        .split(/[\s\-_.,;:!?()[\]{}"']+/)
+        .filter(token => token.length >= 3 && !STOPWORDS.has(token))
+        .slice(0, 10);
+}
+
+/**
+ * Stage 2: Structured Labels με Budget
+ * Δημιουργεί labels για groups με budget/timeout/cache
+ */
+async function performStructuredLabeling(provisionalGroups, summarizerResults) {
+    console.log('🏷️ [Stage 2] Starting structured labeling...');
+    
+    const LABEL_BUDGET_MS = 20000; // 20 second budget
+    const MAX_CONCURRENT_LABELS = 2; // Max 2 concurrent label generations
+    const CACHE_TTL = 30 * 60 * 1000; // 30 minutes cache
+    
+    const startTime = Date.now();
+    const results = [];
+    const activePromises = [];
+    
+    // Sort groups by priority (larger groups first, then by confidence)
+    const sortedGroups = provisionalGroups.sort((a, b) => {
+        if (b.tabIndices.length !== a.tabIndices.length) {
+            return b.tabIndices.length - a.tabIndices.length;
+        }
+        return b.confidence - a.confidence;
+    });
+    
+    for (const group of sortedGroups) {
+        // Check budget
+        if (Date.now() - startTime > LABEL_BUDGET_MS) {
+            console.log('🏷️ [Stage 2] Budget exceeded, stopping labeling');
+            break;
+        }
+        
+        // Check cache first
+        const cacheKey = `group_label_${group.primaryTopic}_${group.tabIndices.length}`;
+        const cached = await chrome.storage.session.get([cacheKey]);
+        if (cached[cacheKey] && (Date.now() - cached[cacheKey].timestamp) < CACHE_TTL) {
+            console.log(`🏷️ [Stage 2] Using cached label for: ${group.name}`);
+            results.push({ ...group, label: cached[cacheKey].label, cached: true });
+            continue;
+        }
+        
+        // Limit concurrent operations
+        if (activePromises.length >= MAX_CONCURRENT_LABELS) {
+            await Promise.race(activePromises);
+        }
+        
+        // Start labeling
+        const promise = generateGroupLabel(group, summarizerResults).then(label => {
+            // Cache result
+            chrome.storage.session.set({
+                [cacheKey]: {
+                    label,
+                    timestamp: Date.now()
+                }
+            });
+            return { ...group, label, cached: false };
+        }).catch(error => {
+            console.warn(`🏷️ [Stage 2] Labeling failed for ${group.name}:`, error.message);
+            return { ...group, label: group.name, error: error.message };
+        });
+        
+        activePromises.push(promise);
+        results.push(promise);
+    }
+    
+    // Wait for all active operations
+    await Promise.all(activePromises);
+    
+    const finalResults = await Promise.all(results);
+    const successCount = finalResults.filter(r => r.label && !r.error).length;
+    const cachedCount = finalResults.filter(r => r.cached).length;
+    
+    console.log('🏷️ [Stage 2] Structured labeling complete:', {
+        total: provisionalGroups.length,
+        processed: finalResults.length,
+        success: successCount,
+        cached: cachedCount,
+        failed: finalResults.length - successCount - cachedCount,
+        duration: Date.now() - startTime
+    });
+    
+    return finalResults;
+}
+
+/**
+ * Δημιουργεί label για ένα group
+ */
+async function generateGroupLabel(group, summarizerResults) {
+    // Enhanced group descriptor with summarizer results
+    const descriptor = {
+        primaryTopic: group.primaryTopic,
+        keywords: group.keywords,
+        tabCount: group.tabIndices.length,
+        confidence: group.confidence,
+        domain: group.domain,
+        summaries: summarizerResults
+            .filter(r => group.tabIndices.includes(r.index))
+            .map(r => r.summary)
+            .filter(Boolean)
+    };
+    
+    // Generate label using existing logic but optimized
+    const label = await generateOptimizedGroupLabel(descriptor);
+    return label;
+}
+
+/**
+ * Optimized group label generation
+ */
+async function generateOptimizedGroupLabel(descriptor) {
+    // Use existing label generation logic but with optimizations
+    // This is a placeholder - will integrate with existing label generation
+    const baseLabel = descriptor.primaryTopic.charAt(0).toUpperCase() + descriptor.primaryTopic.slice(1);
+    
+    if (descriptor.tabCount > 1) {
+        return `${baseLabel} Content`;
+    } else {
+        return baseLabel;
+    }
+}
+
+/**
+ * Stage 3: Targeted Score Updates
+ * Ενημερώνει scores μόνο στα αμφίβολα ζεύγη/clusters
+ */
+async function performTargetedScoreUpdates(labeledGroups, summarizerResults) {
+    console.log('🎯 [Stage 3] Starting targeted score updates...');
+    
+    const ambiguousPairs = findAmbiguousPairs(labeledGroups);
+    console.log(`🎯 [Stage 3] Found ${ambiguousPairs.length} ambiguous pairs for score updates`);
+    
+    const updatedGroups = [...labeledGroups];
+    
+    for (const pair of ambiguousPairs) {
+        const updatedScore = await calculateEnhancedScore(pair, summarizerResults);
+        
+        // Update similarity scores for this pair
+        if (updatedScore.confidence > 0.7) {
+            // High confidence - merge groups
+            const mergedGroup = mergeGroups(pair.groupA, pair.groupB, updatedScore);
+            updatedGroups.push(mergedGroup);
+            
+            // Remove original groups
+            const indexA = updatedGroups.findIndex(g => g === pair.groupA);
+            const indexB = updatedGroups.findIndex(g => g === pair.groupB);
+            if (indexA > -1) updatedGroups.splice(indexA, 1);
+            if (indexB > -1) updatedGroups.splice(indexB, 1);
+        }
+    }
+    
+    console.log('🎯 [Stage 3] Targeted score updates complete:', {
+        ambiguousPairs: ambiguousPairs.length,
+        finalGroups: updatedGroups.length
+    });
+    
+    return updatedGroups;
+}
+
+/**
+ * Stage 4: Centroid Stabilization
+ * Εκτελεί centroid-based merging για σταθεροποίηση
+ */
+async function performCentroidStabilization(groups) {
+    console.log('🔄 [Stage 4] Starting centroid stabilization...');
+    
+    const stabilizedGroups = [...groups];
+    let mergeCount = 0;
+    
+    // Find groups with similar centroids
+    for (let i = 0; i < stabilizedGroups.length; i++) {
+        for (let j = i + 1; j < stabilizedGroups.length; j++) {
+            const groupA = stabilizedGroups[i];
+            const groupB = stabilizedGroups[j];
+            
+            const centroidSimilarity = calculateCentroidSimilarity(groupA, groupB);
+            
+            if (centroidSimilarity > 0.75) { // High centroid similarity threshold
+                // Merge groups
+                const mergedGroup = mergeGroups(groupA, groupB, { confidence: centroidSimilarity });
+                stabilizedGroups.push(mergedGroup);
+                
+                // Remove original groups
+                stabilizedGroups.splice(j, 1);
+                stabilizedGroups.splice(i, 1);
+                
+                mergeCount++;
+                i--; // Adjust index after removal
+                break;
+            }
+        }
+    }
+    
+    console.log('🔄 [Stage 4] Centroid stabilization complete:', {
+        originalGroups: groups.length,
+        finalGroups: stabilizedGroups.length,
+        merges: mergeCount
+    });
+    
+    return stabilizedGroups;
+}
+
+/**
+ * Βρίσκει αμφίβολα ζεύγη που χρειάζονται score updates
+ */
+function findAmbiguousPairs(groups) {
+    const pairs = [];
+    
+    for (let i = 0; i < groups.length; i++) {
+        for (let j = i + 1; j < groups.length; j++) {
+            const groupA = groups[i];
+            const groupB = groups[j];
+            
+            // Check if this pair is ambiguous (similar but not identical)
+            const similarity = calculateBasicSimilarity(groupA, groupB);
+            
+            if (similarity > 0.3 && similarity < 0.7) { // Ambiguous range
+                pairs.push({
+                    groupA,
+                    groupB,
+                    basicSimilarity: similarity
+                });
+            }
+        }
+    }
+    
+    return pairs;
+}
+
+/**
+ * Υπολογίζει enhanced score με summarizer data
+ */
+async function calculateEnhancedScore(pair, summarizerResults) {
+    const { groupA, groupB } = pair;
+    
+    // Get summarizer results for both groups
+    const summariesA = summarizerResults.filter(r => groupA.tabIndices.includes(r.index));
+    const summariesB = summarizerResults.filter(r => groupB.tabIndices.includes(r.index));
+    
+    // Calculate enhanced similarity
+    let enhancedScore = pair.basicSimilarity;
+    
+    // Boost score if summaries are similar
+    if (summariesA.length > 0 && summariesB.length > 0) {
+        const summarySimilarity = calculateSummarySimilarity(summariesA, summariesB);
+        enhancedScore += summarySimilarity * 0.3; // 30% boost from summaries
+    }
+    
+    // Boost score if topics match
+    if (groupA.primaryTopic === groupB.primaryTopic) {
+        enhancedScore += 0.2;
+    }
+    
+    return {
+        score: Math.min(enhancedScore, 1.0),
+        confidence: enhancedScore > 0.6 ? 0.8 : 0.5
+    };
+}
+
+/**
+ * Υπολογίζει centroid similarity μεταξύ δύο groups
+ */
+function calculateCentroidSimilarity(groupA, groupB) {
+    // Simple centroid similarity based on keywords and topics
+    const keywordsA = new Set(groupA.keywords || []);
+    const keywordsB = new Set(groupB.keywords || []);
+    
+    const intersection = new Set([...keywordsA].filter(x => keywordsB.has(x)));
+    const union = new Set([...keywordsA, ...keywordsB]);
+    
+    const keywordSimilarity = union.size > 0 ? intersection.size / union.size : 0;
+    
+    // Topic similarity
+    const topicSimilarity = groupA.primaryTopic === groupB.primaryTopic ? 1.0 : 0.0;
+    
+    // Weighted combination
+    return keywordSimilarity * 0.7 + topicSimilarity * 0.3;
+}
+
+/**
+ * Υπολογίζει basic similarity μεταξύ δύο groups
+ */
+function calculateBasicSimilarity(groupA, groupB) {
+    const keywordsA = new Set(groupA.keywords || []);
+    const keywordsB = new Set(groupB.keywords || []);
+    
+    const intersection = new Set([...keywordsA].filter(x => keywordsB.has(x)));
+    const union = new Set([...keywordsA, ...keywordsB]);
+    
+    return union.size > 0 ? intersection.size / union.size : 0;
+}
+
+/**
+ * Υπολογίζει summary similarity
+ */
+function calculateSummarySimilarity(summariesA, summariesB) {
+    // Simple text similarity between summaries
+    const textA = summariesA.map(s => s.summary).join(' ').toLowerCase();
+    const textB = summariesB.map(s => s.summary).join(' ').toLowerCase();
+    
+    const wordsA = new Set(textA.split(/\s+/));
+    const wordsB = new Set(textB.split(/\s+/));
+    
+    const intersection = new Set([...wordsA].filter(x => wordsB.has(x)));
+    const union = new Set([...wordsA, ...wordsB]);
+    
+    return union.size > 0 ? intersection.size / union.size : 0;
+}
+
+/**
+ * Ενώνει δύο groups
+ */
+function mergeGroups(groupA, groupB, score) {
+    // Deduplicate tabIndices to avoid duplicates
+    const combinedIndices = [...groupA.tabIndices, ...groupB.tabIndices];
+    const uniqueIndices = [...new Set(combinedIndices)];
+    
+    return {
+        tabIndices: uniqueIndices,
+        primaryTopic: groupA.primaryTopic, // Keep first group's topic
+        keywords: [...new Set([...(groupA.keywords || []), ...(groupB.keywords || [])])].slice(0, 15),
+        confidence: Math.max(groupA.confidence || 0, groupB.confidence || 0),
+        domain: groupA.domain, // Keep first group's domain
+        name: groupA.name, // Keep first group's name
+        merged: true,
+        mergeScore: score.confidence
+    };
+}
+
+/**
+ * Stage 5: AI Ensemble Fusion (sharded approach)
+ * Τρέχει AI one-shot σε shards και τα συνδυάζει με deterministic
+ */
+async function performAIEnsembleFusion(deterministicGroups, tabDataForAI) {
+    console.log('🤖🤖🤖 [AI ENSEMBLE FUSION START] 🤖🤖🤖');
+    console.log('🤖 [Stage 5] Starting AI ensemble fusion...');
+    
+    // Clear cache for debugging
+    await clearAllCache();
+    
+    const FUSION_WEIGHTS = { det: 0.65, ai: 0.25, tax: 0.10 }; // Σφιχτά βάρη
+    const FUSION_JOIN_THRESHOLD = 0.25; // Εξαιρετικά χαμηλό threshold για S2 test
+    const FUSION_CENTROID_THRESHOLD = 0.35; // Εξαιρετικά χαμηλό threshold για S2 test
+    const SHARD_SIZE = 12; // Max 12 tabs per shard
+    const SHARD_TIMEOUT = 12000; // 12s per shard
+    const OVERALL_BUDGET = 15000; // 15s total budget
+    const MAX_CONCURRENT_SHARDS = 2; // Max 2 concurrent shards
+    
+    const startTime = Date.now();
+    const aiSuggestions = new Map(); // tabIndex -> { groupId, confidence }
+    
+    // 1. Create shards from deterministic groups
+    const shards = createShardsFromGroups(deterministicGroups, tabDataForAI, SHARD_SIZE);
+    console.log(`🤖 [Stage 5] Created ${shards.length} shards for AI processing`);
+    
+    // 2. Process each shard with AI (with budget control)
+    for (let i = 0; i < shards.length; i++) {
+        const shard = shards[i];
+        console.log(`🤖 [Stage 5] Processing shard ${i + 1}/${shards.length} with ${shard.tabIndices.length} tabs`);
+        
+        if (Date.now() - startTime > OVERALL_BUDGET) {
+            console.log('🤖 [Stage 5] Budget exceeded, stopping AI processing');
+            break;
+        }
+        
+        try {
+            const aiResult = await processShardWithAI(shard, tabDataForAI, SHARD_TIMEOUT);
+            console.log(`🤖 [Stage 5] Shard ${i + 1} AI result:`, aiResult);
+            
+            if (aiResult && aiResult.keywords) {
+                console.log(`🤖 [Stage 5] Shard ${i + 1} has ${aiResult.keywords.length} keyword sets`);
+                // Store AI keywords for deterministic grouping
+                aiResult.keywords.forEach((kwSet, index) => {
+                    // Map local shard index to global tab index
+                    const globalIndex = shard.tabIndices[kwSet.index];
+                    console.log(`🤖 [Stage 5] Tab ${kwSet.index} (global: ${globalIndex}): [${kwSet.keywords?.join(', ') || 'none'}]`);
+                    if (kwSet.keywords && kwSet.keywords.length > 0 && typeof globalIndex === 'number') {
+                        aiSuggestions.set(globalIndex, {
+                            keywords: kwSet.keywords,
+                            confidence: 0.8 // High confidence for AI-generated keywords
+                        });
+                    }
+                });
+            } else {
+                console.log(`🤖 [Stage 5] Shard ${i + 1} has no valid AI result`);
+            }
+        } catch (error) {
+            console.warn(`🤖 [Stage 5] AI processing failed for shard ${i + 1}:`, error.message);
+            console.warn(`🤖 [Stage 5] Error details:`, error);
+        }
+    }
+    
+    console.log(`🤖 [Stage 5] AI suggestions collected: ${aiSuggestions.size} tabs`);
+    
+    // Λεπτομερές logging για τα AI suggestions
+    if (aiSuggestions.size > 0) {
+        console.log('🤖 [AI Suggestions] AI suggested these tab groupings:');
+        const suggestionsArray = Array.from(aiSuggestions.entries());
+        suggestionsArray.forEach(([tabIndex, groupInfo], index) => {
+            console.log(`🤖 [AI Suggestion ${index}] Tab ${tabIndex} → Group "${groupInfo.name}" (confidence: ${groupInfo.confidence})`);
+        });
+    } else {
+        console.log('🤖 [AI Suggestions] No AI suggestions found');
+    }
+    
+    // 3. Fusion scoring: combine deterministic + AI + taxonomy
+    const fusionGroups = await performFusionScoring(
+        deterministicGroups, 
+        aiSuggestions, 
+        tabDataForAI,
+        FUSION_WEIGHTS,
+        FUSION_JOIN_THRESHOLD,
+        FUSION_CENTROID_THRESHOLD
+    );
+    
+    console.log('🤖 [Stage 5] AI ensemble fusion complete:', {
+        originalGroups: deterministicGroups.length,
+        finalGroups: fusionGroups.length,
+        aiSuggestions: aiSuggestions.size,
+        duration: Date.now() - startTime
+    });
+    console.log('🤖🤖🤖 [AI ENSEMBLE FUSION END] 🤖🤖🤖');
+    
+    return fusionGroups;
+}
+
+/**
+ * Δημιουργεί shards από deterministic groups
+ */
+function createShardsFromGroups(groups, tabDataForAI, maxSize) {
+    const shards = [];
+    
+    // Create mixed shard with all unique tab indices
+    const allTabIndices = [...new Set(groups.flatMap(g => g.tabIndices))];
+    
+    if (allTabIndices.length > 0) {
+        // Create one mixed shard with all tabs for comprehensive AI analysis
+        shards.push({
+            tabIndices: allTabIndices,
+            groupId: 'mixed_all_tabs',
+            type: 'mixed',
+            primaryTopic: 'mixed',
+            keywords: []
+        });
+    }
+    
+    console.log(`🤖 [Shards] Created ${shards.length} shard(s):`, shards.map(s => ({
+        type: s.type,
+        size: s.tabIndices.length,
+        groupId: s.groupId
+    })));
+    
+    return shards;
+}
+
+/**
+ * Επεξεργάζεται ένα shard με AI
+ */
+async function processShardWithAI(shard, tabDataForAI, timeout) {
+    console.log(`🤖 [Stage 5] Processing shard with ${shard.tabIndices.length} tab indices`);
+    const shardTabs = shard.tabIndices.map(index => tabDataForAI[index]).filter(Boolean);
+    console.log(`🤖 [Stage 5] Shard tabs after filtering: ${shardTabs.length}`);
+    
+    if (shardTabs.length === 0) {
+        console.log(`🤖 [Stage 5] No valid tabs in shard, returning null`);
+        return null;
+    }
+    
+    // Create compact prompt
+    const prompt = createShardPrompt(shardTabs);
+    console.log(`🤖 [Stage 5] Created prompt with length: ${prompt.length}`);
+    console.log('🤖 [Stage 5] Prompt being sent to AI:', prompt);
+    
+    // Check cache first (DISABLED for debugging)
+    const cacheKey = `ai_shard_${shardTabs.map(t => t.contentHash || t.url).join('_')}`;
+    const cached = await chrome.storage.session.get([cacheKey]);
+    if (cached[cacheKey] && (Date.now() - cached[cacheKey].timestamp) < 10 * 60 * 1000) {
+        console.log(`🤖 [Stage 5] CACHE DISABLED - forcing fresh AI result for shard`);
+        // return cached[cacheKey].result; // DISABLED
+    }
+    
+    try {
+        console.log(`🤖 [Stage 5] Executing AI grouping with timeout: ${timeout}ms`);
+        // Execute AI grouping with timeout
+        const result = await executeAIGroupingWithTimeout(prompt, timeout);
+        console.log(`🤖 [Stage 5] AI grouping completed, result:`, result);
+        
+        // Cache result (DISABLED for debugging)
+        // await chrome.storage.session.set({
+        //     [cacheKey]: {
+        //         result,
+        //         timestamp: Date.now()
+        //     }
+        // });
+        
+        return result;
+    } catch (error) {
+        console.warn(`🤖 [Stage 5] AI grouping failed for shard:`, error.message);
+        console.warn(`🤖 [Stage 5] Error details:`, error);
+        return null;
+    }
+}
+
+/**
+ * Δημιουργεί compact prompt για shard
+ */
+function createShardPrompt(shardTabs) {
+    const tabsInfo = shardTabs.map((tab, index) => {
+        return `${index}: "${tab.title}" - ${tab.url}`;
+    }).join('\n');
+    
+    return `For each tab, generate 3-5 keywords that describe its main theme/purpose. Return JSON: {"keywords":[{"index":0,"keywords":["keyword1","keyword2","keyword3"]}]}
+
+Tabs:
+${tabsInfo}`;
+}
+
+/**
+ * Εκτελεί AI grouping με timeout
+ */
+async function executeAIGroupingWithTimeout(prompt, timeout) {
+    console.log('🤖🤖🤖 [AI CLUSTERING START] 🤖🤖🤖');
+    console.log('🤖 [AI] Executing AI grouping with timeout:', timeout, 'ms');
+    console.log('🤖 [AI] Prompt length:', prompt.length, 'characters');
+    
+    try {
+        // Use the existing AI grouping function from content script
+        const result = await withTimeout((async () => {
+            // Execute AI grouping in content script context
+            const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+            if (!tab) throw new Error('No active tab found');
+            
+        // Use direct execution in page context
+        console.log('🤖 [AI] Using executeScript on tab:', tab.id, tab.url);
+        
+        // Find a usable tab (not chrome://, etc.)
+        const usableTab = tab.url.startsWith('http') ? tab : 
+            await chrome.tabs.query({ url: ['http://*/*', 'https://*/*'] }).then(tabs => tabs[0]);
+        
+        if (!usableTab) {
+            throw new Error('No usable tab found for AI execution');
+        }
+        
+        console.log('🤖 [AI] Using executeScript on tab:', usableTab.id, usableTab.url);
+        
+        console.log('🤖 [AI] Attempting to inject and execute AI grouping...');
+        
+        // First, inject content script if needed
+        try {
+            await chrome.scripting.executeScript({
+                target: { tabId: usableTab.id },
+                files: ['content.js']
+            });
+            console.log('🤖 [AI] Content script injected');
+        } catch (err) {
+            console.warn('🤖 [AI] Content script already injected or injection failed:', err.message);
+        }
+        
+        const results = await chrome.scripting.executeScript({
+            target: { tabId: usableTab.id },
+            world: 'ISOLATED',
+            func: async (prompt) => {
+                console.log('🤖 [AI] Inside executeScript function, prompt length:', prompt.length);
+                console.log('🤖 [AI] window.AITabCompanion exists:', typeof window.AITabCompanion !== 'undefined');
+                
+                // Wait a bit for AITabCompanion to load
+                let attempts = 0;
+                while (typeof window.AITabCompanion === 'undefined' && attempts < 10) {
+                    console.log('🤖 [AI] Waiting for AITabCompanion, attempt', attempts);
+                    await new Promise(resolve => setTimeout(resolve, 100));
+                    attempts++;
+                }
+                
+                if (typeof window.AITabCompanion !== 'undefined') {
+                    console.log('🤖 [AI] AITabCompanion found!');
+                    console.log('🤖 [AI] AITabCompanion object:', window.AITabCompanion);
+                    console.log('🤖 [AI] performAIGrouping available:', typeof window.AITabCompanion.performAIGrouping);
+                    console.log('🤖 [AI] AITabCompanion methods:', Object.keys(window.AITabCompanion));
+                    
+                    if (window.AITabCompanion.performAIGrouping) {
+                        console.log('🤖 [AI] Executing performAIGrouping...');
+                        console.log('🤖 [AI] Prompt being sent to AI:', prompt.substring(0, 200) + '...');
+                        try {
+                            const result = await window.AITabCompanion.performAIGrouping(prompt);
+                            console.log('🤖 [AI] performAIGrouping completed, result type:', typeof result);
+                            console.log('🤖 [AI] performAIGrouping result:', result);
+                            console.log('🤖 [AI] performAIGrouping result length:', result?.length || 'no length');
+                            return result;
+                        } catch (aiError) {
+                            console.error('🤖 [AI] performAIGrouping failed:', aiError);
+                            console.error('🤖 [AI] Error details:', {
+                                name: aiError.name,
+                                message: aiError.message,
+                                stack: aiError.stack
+                            });
+                            return { groups: [], confidence: 0.5 };
+                        }
+                    } else {
+                        console.error('🤖 [AI] performAIGrouping function not found');
+                        throw new Error('performAIGrouping function not found');
+                    }
+                } else {
+                    console.error('🤖 [AI] AITabCompanion still not available after waiting');
+                    console.error('🤖 [AI] window keys:', Object.keys(window).slice(0, 20));
+                    throw new Error('AITabCompanion not available after waiting');
+                }
+            },
+            args: [prompt]
+        });
+        
+        console.log('🤖 [AI] executeScript returned:', results);
+        console.log('🤖 [AI] executeScript results length:', results?.length || 0);
+        console.log('🤖 [AI] First result:', results[0]);
+        console.log('🤖 [AI] First result documentId:', results[0]?.documentId);
+        console.log('🤖 [AI] First result frameId:', results[0]?.frameId);
+        
+        const aiResult = results[0]?.result;
+            
+            console.log('🤖 [AI] Raw AI result:', aiResult);
+            console.log('🤖 [AI] Raw AI result type:', typeof aiResult);
+            console.log('🤖 [AI] Raw AI result length:', aiResult?.length || 'no length');
+            
+            // Log raw JSON response if available
+            if (aiResult && typeof aiResult === 'object' && aiResult.groups) {
+                console.log('🤖 [AI Raw JSON] Full AI response object:', JSON.stringify(aiResult, null, 2));
+            }
+            
+            // Λεπτομερές debugging για την απάντηση του AI
+            if (aiResult && typeof aiResult === 'object') {
+                console.log('🤖 [AI] AI result has groups:', aiResult.groups?.length || 0);
+                console.log('🤖 [AI] AI result confidence:', aiResult.confidence);
+                if (aiResult.groups && aiResult.groups.length === 0) {
+                    console.log('🤖 [AI] ⚠️ AI returned empty groups array - this might indicate the AI could not find similar tabs to group');
+                }
+            }
+            
+            // Parse AI result if it's a string
+            if (typeof aiResult === 'string') {
+                try {
+                    const parsed = JSON.parse(aiResult);
+                    console.log('🤖 [AI] Parsed AI result:', parsed);
+                    return parsed;
+                } catch (error) {
+                    console.warn('🤖 [AI] Failed to parse AI result as JSON:', error);
+                    return { groups: [], confidence: 0.5 };
+                }
+            }
+            
+            // If it's a function, return empty result
+            if (typeof aiResult === 'function') {
+                console.warn('🤖 [AI] AI result is a function, returning empty result');
+                return { groups: [], confidence: 0.5 };
+            }
+            
+            return aiResult || { groups: [], confidence: 0.5 };
+        })(), timeout, 'AI grouping timeout');
+        
+        console.log('🤖 [AI] AI grouping result:', result);
+        
+        // Λεπτομερές logging για τα keywords που επέστρεψε το AI
+        if (result && result.keywords && Array.isArray(result.keywords)) {
+            console.log('🤖 [AI Keywords] AI returned', result.keywords.length, 'keyword sets');
+            if (result.keywords.length === 0) {
+                console.log('🤖 [AI Keywords] ⚠️ AI returned 0 keyword sets - this might indicate an issue with the AI response');
+                console.log('🤖 [AI Keywords] Full AI result object:', JSON.stringify(result, null, 2));
+            }
+            result.keywords.forEach((kwSet, index) => {
+                console.log(`🤖 [AI Keywords ${index}] Tab ${kwSet.index}: [${kwSet.keywords?.join(', ') || 'none'}]`);
+            });
+        } else {
+            console.log('🤖 [AI Keywords] No valid keywords found in AI result');
+            console.log('🤖 [AI Keywords] Full result object:', JSON.stringify(result, null, 2));
+        }
+        
+        console.log('🤖🤖🤖 [AI CLUSTERING END] 🤖🤖🤖');
+        return result || { groups: [], confidence: 0.5 };
+        
+    } catch (error) {
+        console.warn('🤖 [AI] AI grouping failed:', error.message);
+        console.log('🤖🤖🤖 [AI CLUSTERING END] 🤖🤖🤖');
+        return { groups: [], confidence: 0.5 };
+    }
+}
+
+/**
+ * Εκτελεί fusion scoring
+ */
+async function performFusionScoring(deterministicGroups, aiSuggestions, tabDataForAI, weights, joinThreshold, centroidThreshold) {
+    console.log('🤖 [Stage 5] Performing fusion scoring...');
+    console.log('🤖 [Fusion] Input groups:', deterministicGroups.map(g => ({
+        name: g.name,
+        tabCount: g.tabIndices.length,
+        keywords: g.keywords?.slice(0, 3)
+    })));
+    console.log('🤖 [Fusion] Weights:', weights);
+    console.log('🤖 [Fusion] Join threshold:', joinThreshold);
+    console.log('🤖 [Fusion] Centroid threshold:', centroidThreshold);
+    
+    // Λεπτομερές logging για τα AI suggestions στο fusion
+    if (aiSuggestions.size > 0) {
+        console.log('🤖 [Fusion] AI suggestions being used in fusion:');
+        const suggestionsArray = Array.from(aiSuggestions.entries());
+        suggestionsArray.forEach(([tabIndex, groupInfo]) => {
+            console.log(`🤖 [Fusion AI] Tab ${tabIndex} → "${groupInfo.name}" (confidence: ${groupInfo.confidence})`);
+        });
+    } else {
+        console.log('🤖 [Fusion] No AI suggestions available for fusion');
+    }
+    
+    const fusionGroups = [...deterministicGroups];
+    const processed = new Set();
+    
+    // Calculate fusion scores for all pairs
+    for (let i = 0; i < tabDataForAI.length; i++) {
+        for (let j = i + 1; j < tabDataForAI.length; j++) {
+            if (processed.has(`${i}-${j}`)) continue;
+            
+            const fusionScore = calculateFusionScore(i, j, aiSuggestions, tabDataForAI, weights);
+            
+            // Log all fusion scores for debugging
+            if (fusionScore > 0.1) { // Log scores above 0.1
+                console.log(`🔍 [Fusion] Score for tabs ${i}-${j}: ${fusionScore.toFixed(3)} (${tabDataForAI[i]?.title?.substring(0, 30)} + ${tabDataForAI[j]?.title?.substring(0, 30)})`);
+            }
+            
+            if (fusionScore >= joinThreshold) {
+                console.log(`🔗 [Fusion] High similarity detected: tabs ${i}-${j}, score: ${fusionScore.toFixed(3)} (threshold: ${joinThreshold})`);
+                
+                // Merge tabs
+                const groupA = findGroupContaining(fusionGroups, i);
+                const groupB = findGroupContaining(fusionGroups, j);
+                
+                if (groupA && groupB && groupA !== groupB) {
+                    console.log(`🔗 [Fusion] Merging groups: ${groupA.name || 'Unknown'} + ${groupB.name || 'Unknown'}`);
+                    
+                    // Merge groups
+                    const mergedGroup = mergeFusionGroups(groupA, groupB, fusionScore);
+                    fusionGroups.push(mergedGroup);
+                    
+                    // Remove original groups
+                    const indexA = fusionGroups.indexOf(groupA);
+                    const indexB = fusionGroups.indexOf(groupB);
+                    if (indexA > -1) fusionGroups.splice(indexA, 1);
+                    if (indexB > -1) fusionGroups.splice(indexB, 1);
+                } else if (groupA && groupB && groupA === groupB) {
+                    console.log(`🔗 [Fusion] Tabs ${i}-${j} already in same group: ${groupA.name || 'Unknown'}`);
+                } else {
+                    console.log(`🔗 [Fusion] Cannot merge tabs ${i}-${j}: groupA=${groupA?.name || 'null'}, groupB=${groupB?.name || 'null'}`);
+                }
+                
+                processed.add(`${i}-${j}`);
+            }
+        }
+    }
+    
+    // Centroid-based merging
+    return performCentroidFusion(fusionGroups, centroidThreshold);
+}
+
+/**
+ * Υπολογίζει fusion score για ένα ζεύγος
+ */
+function calculateFusionScore(i, j, aiSuggestions, tabDataForAI, weights) {
+    const tabI = tabDataForAI[i];
+    const tabJ = tabDataForAI[j];
+    
+    // Deterministic score - χρήση πραγματικού similarity
+    const rawSimilarity = calculateTabSimilarity(tabI, tabJ);
+    const detScore = rawSimilarity / 100; // Normalize to 0-1
+    
+    // Log deterministic similarity for debugging
+    if (rawSimilarity > 10) { // Log similarities above 10
+        console.log(`🔍 [Det] Raw similarity for tabs ${i}-${j}: ${rawSimilarity.toFixed(1)} (${tabI.title?.substring(0, 30)} + ${tabJ.title?.substring(0, 30)})`);
+        
+        // Log keywords for debugging
+        const keywords1 = extractKeywordsFromText(tabI.title);
+        const keywords2 = extractKeywordsFromText(tabJ.title);
+        const commonKeywords = keywords1.filter(kw => keywords2.includes(kw));
+        console.log(`🔍 [Det] Keywords1: [${keywords1.slice(0, 5).join(', ')}]`);
+        console.log(`🔍 [Det] Keywords2: [${keywords2.slice(0, 5).join(', ')}]`);
+        console.log(`🔍 [Det] Common keywords: [${commonKeywords.join(', ')}]`);
+    }
+    
+    // AI keyword similarity
+    const aiI = aiSuggestions.get(i);
+    const aiJ = aiSuggestions.get(j);
+    let aiAgree = 0;
+    if (aiI && aiJ && aiI.keywords && aiJ.keywords) {
+        // Calculate keyword similarity
+        const keywords1 = new Set(aiI.keywords);
+        const keywords2 = new Set(aiJ.keywords);
+        const intersection = new Set([...keywords1].filter(x => keywords2.has(x)));
+        const union = new Set([...keywords1, ...keywords2]);
+        aiAgree = intersection.size / union.size; // Jaccard similarity
+    }
+    
+    // Taxonomy agreement
+    const taxI = tabI.primaryTopic || 'general';
+    const taxJ = tabJ.primaryTopic || 'general';
+    const taxAgree = (taxI === taxJ && taxI !== 'general') ? 1 : 0;
+    
+    // Log taxonomy agreement for debugging
+    if (rawSimilarity > 10) {
+        console.log(`🔍 [Tax] Primary topics: "${taxI}" vs "${taxJ}" → Agreement: ${taxAgree}`);
+    }
+    
+    // Calculate weighted score
+    let score = weights.det * detScore + weights.ai * aiAgree + weights.tax * taxAgree;
+    
+    // Log detailed score calculation
+    if (rawSimilarity > 10) {
+        console.log(`🔍 [Score Calc] Tab ${i}-${j} score breakdown:`);
+        console.log(`   📊 Deterministic: ${detScore.toFixed(3)} × ${weights.det} = ${(weights.det * detScore).toFixed(3)}`);
+        console.log(`   🤖 AI Agreement: ${aiAgree} × ${weights.ai} = ${(weights.ai * aiAgree).toFixed(3)}`);
+        console.log(`   🏷️ Taxonomy: ${taxAgree} × ${weights.tax} = ${(weights.tax * taxAgree).toFixed(3)}`);
+        console.log(`   ➕ Base score: ${score.toFixed(3)}`);
+    }
+    
+    // Apply penalties
+    let penaltyTotal = 0;
+    if (isGenericTab(tabI) || isGenericTab(tabJ)) {
+        score -= 0.20; // Generic penalty
+        penaltyTotal += 0.20;
+        if (rawSimilarity > 10) {
+            console.log(`   ⚠️ Generic penalty: -0.20`);
+        }
+    }
+    
+    if (isBridgeTab(tabI) || isBridgeTab(tabJ)) {
+        score -= 0.05; // Bridge penalty
+        penaltyTotal += 0.05;
+        if (rawSimilarity > 10) {
+            console.log(`   ⚠️ Bridge penalty: -0.05`);
+        }
+    }
+    
+    if (rawSimilarity > 10) {
+        console.log(`   🎯 Final score: ${score.toFixed(3)} (penalties: -${penaltyTotal.toFixed(2)})`);
+    }
+    
+    // Guard: ignore AI if deterministic score is too low
+    if (detScore < 0.35 && aiAgree === 1) {
+        score = weights.det * detScore + weights.tax * taxAgree; // Remove AI weight
+    }
+    
+    return Math.max(0, Math.min(1, score)); // Clamp to [0,1]
+}
+
+/**
+ * Ελέγχει αν ένα tab είναι generic
+ */
+function isGenericTab(tab) {
+    const genericDomains = /news|blog|topics|press|medium|substack/i;
+    const genericKeywords = /news|blog|article|post|update|latest|trending/i;
+    
+    return genericDomains.test(tab.domain) || 
+           genericKeywords.test(tab.title) ||
+           (tab.topicHints && genericKeywords.test(tab.topicHints));
+}
+
+/**
+ * Ελέγχει αν ένα tab είναι bridge (συνδέει διαφορετικά topics)
+ */
+function isBridgeTab(tab) {
+    const bridgeKeywords = /search|results|find|explore|discover|browse/i;
+    return bridgeKeywords.test(tab.title) || 
+           bridgeKeywords.test(tab.topicHints || '');
+}
+
+/**
+ * Διαγράφει όλο το cache για debugging
+ */
+async function clearAllCache() {
+    try {
+        await chrome.storage.session.clear();
+        await chrome.storage.local.clear();
+        console.log('🧹 [Cache] All cache cleared for debugging');
+    } catch (error) {
+        console.error('Error clearing cache:', error);
+    }
+}
+
+/**
+ * Manual cache clearing function για debugging
+ */
+async function clearCacheManually() {
+    try {
+        await chrome.storage.session.clear();
+        await chrome.storage.local.clear();
+        console.log('🧹 [Manual Cache Clear] All cache cleared manually');
+        return { success: true, message: 'Cache cleared successfully' };
+    } catch (error) {
+        console.error('Error clearing cache manually:', error);
+        return { success: false, error: error.message };
+    }
+}
+
+/**
+ * Βρίσκει group που περιέχει ένα tab
+ */
+function findGroupContaining(groups, tabIndex) {
+    return groups.find(group => group.tabIndices.includes(tabIndex));
+}
+
+/**
+ * Ενώνει δύο groups στο fusion
+ */
+function mergeFusionGroups(groupA, groupB, score) {
+    // Deduplicate tabIndices to avoid duplicates
+    const combinedIndices = [...groupA.tabIndices, ...groupB.tabIndices];
+    const uniqueIndices = [...new Set(combinedIndices)];
+    
+    return {
+        tabIndices: uniqueIndices,
+        primaryTopic: groupA.primaryTopic,
+        keywords: [...new Set([...(groupA.keywords || []), ...(groupB.keywords || [])])],
+        confidence: Math.max(groupA.confidence || 0, groupB.confidence || 0),
+        fusionScore: score,
+        merged: true
+    };
+}
+
+/**
+ * Εκτελεί centroid-based fusion
+ */
+function performCentroidFusion(groups, threshold) {
+    // Implementation for centroid-based merging
+    return groups;
+}
+
+/**
+ * Helper functions
+ */
+function chunkArray(array, size) {
+    const chunks = [];
+    for (let i = 0; i < array.length; i += size) {
+        chunks.push(array.slice(i, i + size));
+    }
+    return chunks;
+}
+
+function extractTaxonomy(tab) {
+    const domain = tab.domain || '';
+    if (domain.includes('pubmed') || domain.includes('nejm')) return 'medical';
+    if (domain.includes('techcrunch') || domain.includes('openai')) return 'technology';
+    if (domain.includes('steam') || domain.includes('ea.com')) return 'gaming';
+    if (domain.includes('amazon') || domain.includes('bestbuy')) return 'shopping';
+    return 'general';
+}
+
+function isGeneric(tab) {
+    const domain = tab.domain || '';
+    return /news|blog|topics|press/.test(domain);
+}
+
+function isBridge(tab) {
+    // Check if tab has high similarity to multiple topics
+    return false; // Placeholder
+}
+
+/**
  * Εκτελεί AI ανάλυση των tabs χρησιμοποιώντας Chrome Built-in AI APIs
  */
 async function performAIAnalysis() {
@@ -1181,11 +2557,46 @@ async function performAIAnalysis() {
         
         console.log(`Prepared ${tabDataForAI.length} tabs for AI analysis`);
         
-        // 1. Semantic feature extraction ανά tab
-        const semanticStart = nowMs();
-        await ensureTabSemanticFeatures(tabDataForAI);
-        logTiming('Semantic feature generation', semanticStart);
-        console.log('Semantic features generated for all tabs');
+        // Stage 0: Smart Triage & Provisional Groups
+        const triageStart = nowMs();
+        const triageResult = await performSmartTriage(tabDataForAI);
+        logTiming('Smart triage & provisional grouping', triageStart);
+        console.log('🎯 [Stage 0] Triage complete:', {
+            totalTabs: triageResult.totalTabs,
+            needsSummarizer: triageResult.needsSummarizer.length,
+            provisionalGroups: triageResult.provisionalGroups.length,
+            confidence: triageResult.avgConfidence
+        });
+        
+        // Stage 1: Selective Summarizer (μόνο όπου χρειάζεται)
+        const summarizerStart = nowMs();
+        const summarizerResults = await performSelectiveSummarization(triageResult.needsSummarizer);
+        logTiming('Selective summarization', summarizerStart);
+        console.log('📄 [Stage 1] Selective summarization complete');
+        
+        // Stage 2: Structured Labels με Budget
+        const labelingStart = nowMs();
+        const labeledGroups = await performStructuredLabeling(triageResult.provisionalGroups, summarizerResults);
+        logTiming('Structured labeling', labelingStart);
+        console.log('🏷️ [Stage 2] Structured labeling complete');
+        
+        // Stage 3: Targeted Score Updates (μόνο αμφίβολα ζεύγη)
+        const scoreUpdateStart = nowMs();
+        const updatedGroups = await performTargetedScoreUpdates(labeledGroups, summarizerResults);
+        logTiming('Targeted score updates', scoreUpdateStart);
+        console.log('🎯 [Stage 3] Targeted score updates complete');
+        
+        // Stage 4: Centroid Stabilization
+        const centroidStart = nowMs();
+        const stabilizedGroups = await performCentroidStabilization(updatedGroups);
+        logTiming('Centroid stabilization', centroidStart);
+        console.log('🔄 [Stage 4] Centroid stabilization complete');
+        
+        // Stage 5: AI Ensemble Fusion (sharded approach)
+        const fusionStart = nowMs();
+        const finalGroups = await performAIEnsembleFusion(stabilizedGroups, tabDataForAI);
+        logTiming('AI ensemble fusion', fusionStart);
+        console.log('🤖 [Stage 5] AI ensemble fusion complete');
         
         // 1b. Embedding extraction for richer semantic similarity
         const embeddingStart = nowMs();
@@ -1193,18 +2604,12 @@ async function performAIAnalysis() {
         logTiming('Embedding generation', embeddingStart);
         console.log('Semantic embeddings generated for all tabs');
         
-        // 2. Deterministic clustering με βάση τα features
-        const clusteringStart = nowMs();
-        const debugLog = ENABLE_MERGE_DEBUG_LOGS ? {
-            pairwise: [],
-            smallGroup: [],
-            nameMerges: [],
-            channelMerges: [],
-            stats: {}
-        } : null;
+        // Use final groups from new pipeline
+        let groups = finalGroups || [];
+        console.log('🎯 [Smart Pipeline] Using final groups from new architecture');
+        
+        // Create featureContext for compatibility with existing code
         const featureContext = prepareTabFeatureContext(tabDataForAI);
-        let groups = clusterTabsDeterministic(featureContext, { debugLog });
-        logTiming('Feature preparation & clustering', clusteringStart);
         console.log('🔍 [Clustering Debug] Deterministic groups created:', groups.map(g => ({
             tabCount: g.tabIndices.length,
             keywords: g.keywords?.slice(0, 6) || [],
@@ -1215,6 +2620,16 @@ async function performAIAnalysis() {
         console.log('📊 [Chrome AI Challenge] Clustering Results:');
         groups.forEach((group, idx) => {
             console.log(`   Group ${idx + 1}: ${group.tabIndices.length} tabs, keywords: [${(group.keywords || []).slice(0, 4).join(', ')}]`);
+            
+            // Log detailed group info
+            console.log(`🔍 [Group ${idx + 1} Details]:`, {
+                tabIndices: group.tabIndices,
+                keywords: group.keywords,
+                primaryTopic: group.primaryTopic,
+                domain: group.domain,
+                name: group.name,
+                confidence: group.confidence
+            });
             
             // Log cluster creation
             devlog({
@@ -1229,14 +2644,22 @@ async function performAIAnalysis() {
         });
         
         const llmRefinementStart = nowMs();
-        groups = await applyLLMRefinement(groups, featureContext, tabDataForAI);
+        if (groups && groups.length > 0 && featureContext && tabDataForAI && tabDataForAI.length > 0) {
+            groups = await applyLLMRefinement(groups, featureContext, tabDataForAI);
+        } else {
+            console.log('⚠️ [Smart Pipeline] Skipping applyLLMRefinement - missing data');
+        }
         logTiming('LLM refinement', llmRefinementStart);
         
-        // 3. Αντιστοίχιση labels (με AI μόνο για naming)
-        const labelingStart = nowMs();
-        await assignGroupLabels(groups, tabDataForAI);
+        // 3. Αντιστοίχιση labels (με AI μόνο για naming) - SKIPPED (using new pipeline)
+        const oldLabelingStart = nowMs();
+        if (groups && groups.length > 0 && tabDataForAI && tabDataForAI.length > 0) {
+            await assignGroupLabels(groups, tabDataForAI);
+        } else {
+            console.log('⚠️ [Smart Pipeline] Skipping assignGroupLabels - missing data');
+        }
         
-        const mergedByName = mergeSimilarNamedGroups(groups, featureContext, { debugLog });
+        const mergedByName = mergeSimilarNamedGroups(groups, featureContext, { debugLog: console.log });
         const nameMerged = mergedByName.length !== groups.length;
         if (nameMerged) {
             console.log(`Merged ${groups.length - mergedByName.length} groups based on similar labels.`);
@@ -1245,7 +2668,7 @@ async function performAIAnalysis() {
         } else {
             groups = mergedByName;
         }
-        logTiming('Group labeling & merge refinement', labelingStart);
+        logTiming('Group labeling & merge refinement', oldLabelingStart);
         
         const beforeFilterCount = groups.length;
         console.log(`🔍 [Clustering Debug] Before filtering: ${beforeFilterCount} groups`);
@@ -1273,8 +2696,15 @@ async function performAIAnalysis() {
             silent: false
         });
         
-        if (debugLog) {
-            const stats = debugLog.stats || {};
+        // Debug logging for clustering stats
+        const debugStats = {
+            pairComparisons: 0,
+            pairUnions: 0,
+            pairMergeRate: 0
+        };
+        
+        if (debugStats) {
+            const stats = debugStats;
             const pairComparisons = stats.pairComparisons || 0;
             const pairUnions = stats.pairUnions || 0;
             const pairMergeRate = pairComparisons ? Number((pairUnions / pairComparisons).toFixed(3)) : 0;
@@ -1283,7 +2713,7 @@ async function performAIAnalysis() {
             const nameComparisons = stats.nameComparisons || 0;
             const nameUnions = stats.nameUnions || 0;
             const channelUnions = stats.channelUnions || 0;
-            const bridgePairs = (debugLog.pairwise || []).filter(entry => entry.bridge).length;
+            const bridgePairs = 0; // No bridge pairs in current implementation
             const bridgeRate = pairUnions ? Number((bridgePairs / pairUnions).toFixed(3)) : 0;
             const purityAvg = groups.length
                 ? Number((groups.reduce((sum, group) => sum + (group.primaryTopicPurity || 0), 0) / groups.length).toFixed(3))
@@ -1301,8 +2731,8 @@ async function performAIAnalysis() {
                 bridgeRate,
                 averagePrimaryTopicPurity: purityAvg
             });
-            featureContext.debugLog = debugLog;
-            lastMergeDebugLog = debugLog;
+            featureContext.debugLog = debugStats;
+            lastMergeDebugLog = debugStats;
         }
         
         // 4. Summaries για κάθε group (deferred)
@@ -4574,24 +6004,30 @@ async function assignGroupLabels(groups, tabDataForAI) {
         labelFailureReasons.add('No accessible tab with Chrome AI support');
     } else {
         try {
+            console.log('🔍 [AI Check] Checking Language Model availability...');
             const availabilityResults = await chrome.scripting.executeScript({
                 target: { tabId: accessibleTab.id },
                 world: 'MAIN',
                 func: checkLanguageModelAvailabilityInPage
             });
             const availability = availabilityResults?.[0]?.result;
+            console.log('🔍 [AI Check] Availability result:', availability);
+            
             if (availability?.ready) {
                 aiLabelReady = true;
                 aiLabelReason = 'ready';
+                console.log('✅ [AI Check] Language Model is ready for labeling');
             } else {
                 aiLabelReady = false;
                 aiLabelReason = availability?.reason || 'Language Model not ready';
                 aiLabelChecksFailed = true;
+                console.log('❌ [AI Check] Language Model not ready:', aiLabelReason);
             }
         } catch (availabilityError) {
             aiLabelReady = false;
             aiLabelChecksFailed = true;
             aiLabelReason = availabilityError?.message || String(availabilityError);
+            console.log('❌ [AI Check] Error checking availability:', aiLabelReason);
         }
     }
 
@@ -4605,7 +6041,7 @@ async function assignGroupLabels(groups, tabDataForAI) {
         let label = cachedEntry ? cachedEntry.label : '';
         let blurb = cachedEntry ? cachedEntry.blurb || '' : '';
 
-        const exemplarTabs = group.representativeTabIndices
+        const exemplarTabs = (group.representativeTabIndices || group.tabIndices || [])
             .map(index => {
                 const entry = indexMap.get(index) || {};
                 const features = entry.semanticFeatures || {};
@@ -4624,8 +6060,8 @@ async function assignGroupLabels(groups, tabDataForAI) {
             .filter(tab => tab.title);
         
         const descriptor = {
-            centroidKeywords: group.centroidTokens.slice(0, 6),
-            fallbackKeywords: group.keywords.slice(0, 8),
+            centroidKeywords: (group.centroidTokens || group.keywords || []).slice(0, 6),
+            fallbackKeywords: (group.keywords || []).slice(0, 8),
             exemplarTabs: exemplarTabs.slice(0, 2),
             domainMode: group.domainMode || '',
             languageMode: group.languageMode || '',
@@ -4640,6 +6076,7 @@ async function assignGroupLabels(groups, tabDataForAI) {
         if ((!label || !blurb) && accessibleTab && aiLabelReady && aiLabelAttempts < MAX_AI_LABEL_GROUPS) {
             try {
                 aiLabelAttempts += 1;
+                console.log(`🧠 [AI Label] Attempting to generate label for group ${groups.indexOf(group) + 1} (attempt ${aiLabelAttempts}/${MAX_AI_LABEL_GROUPS})`);
                 const scriptPromise = chrome.scripting.executeScript({
                     target: { tabId: accessibleTab.id },
                     world: 'MAIN',
@@ -4654,6 +6091,7 @@ async function assignGroupLabels(groups, tabDataForAI) {
                     if (payload.blurb) {
                         blurb = String(payload.blurb).trim().slice(0, 160);
                     }
+                    console.log(`✅ [AI Label] Successfully generated label: "${label}" for group ${groups.indexOf(group) + 1}`);
                 } else if (payload && !payload.ok) {
                     const status = results[0].result.status || null;
                     const errorMessage = results[0].result.error || 'Language model not ready';
@@ -4680,12 +6118,31 @@ async function assignGroupLabels(groups, tabDataForAI) {
         }
 
         if (!label) {
+            // Δημιουργία έξυπνου fallback label βασισμένου στο περιεχόμενο
             const taxonomyFallback = descriptor.taxonomyTags.slice(0, 3);
             const fallbackTokens = descriptor.centroidKeywords.length
                 ? descriptor.centroidKeywords.slice(0, 3)
                 : (taxonomyFallback.length ? taxonomyFallback : descriptor.fallbackKeywords.slice(0, 3));
-            label = titleCaseFromTokens(fallbackTokens) ||
-                (descriptor.domainMode ? titleCaseFromTokens([descriptor.domainMode]) : `Group ${groups.indexOf(group) + 1}`);
+            
+            // Προσπάθεια δημιουργίας περιγραφικού label
+            if (fallbackTokens.length > 0) {
+                label = titleCaseFromTokens(fallbackTokens);
+            } else if (descriptor.domainMode) {
+                label = titleCaseFromTokens([descriptor.domainMode]);
+            } else if (descriptor.primaryTopic) {
+                label = titleCaseFromTokens(tokenizeText(descriptor.primaryTopic).slice(0, 2));
+            } else if (group.tabs && group.tabs.length > 0) {
+                // Χρήση του πρώτου tab title για fallback
+                const firstTab = group.tabs[0];
+                if (firstTab && firstTab.title) {
+                    const titleTokens = tokenizeText(firstTab.title).slice(0, 2);
+                    label = titleCaseFromTokens(titleTokens) || 'Web Content';
+                } else {
+                    label = 'Web Content';
+                }
+            } else {
+                label = `Group ${groups.indexOf(group) + 1}`;
+            }
         }
         if (!blurb) {
             blurb = buildFallbackBlurb(descriptor, group, label);
@@ -4697,7 +6154,7 @@ async function assignGroupLabels(groups, tabDataForAI) {
         }
         
         group.name = label;
-        group.keywords = group.keywords.slice(0, 10);
+        group.keywords = (group.keywords || []).slice(0, 10);
         group.taxonomyTags = descriptor.taxonomyTags;
         group.displayBlurb = blurb;
         group.oneLiner = blurb;
@@ -5964,9 +7421,18 @@ ${tabLines}
             `.trim();
             
                 console.log('🧠 [GroupLabel] Prompt:', prompt.substring(0, 600));
+                console.log('🧠 [GroupLabel] Full prompt length:', prompt.length);
+                console.log('🧠 [GroupLabel] Descriptor info:', {
+                    centroidKeywords: descriptor.centroidKeywords,
+                    fallbackKeywords: descriptor.fallbackKeywords,
+                    primaryTopic: descriptor.primaryTopic,
+                    domainMode: descriptor.domainMode,
+                    exemplarTabs: descriptor.exemplarTabs?.length || 0
+                });
                 
                 const raw = await session.prompt(prompt);
                 console.log('🧠 [GroupLabel] Raw response type/length:', typeof raw, raw?.length ?? 'n/a');
+                console.log('🧠 [GroupLabel] Raw response content:', raw);
                 const match = typeof raw === 'string'
                     ? raw.match(/\{[\s\S]*\}/)
                     : null;
@@ -5983,6 +7449,12 @@ ${tabLines}
                     throw new Error('No label returned');
                 }
                 const blurb = String(parsed.blurb || '').trim().slice(0, 160);
+                
+                console.log('🧠 [GroupLabel] Parsed result:', {
+                    label: label,
+                    blurb: blurb,
+                    fullParsed: parsed
+                });
                 
                 return {
                     ok: true,
@@ -6854,7 +8326,7 @@ ${tabsInfo}
 /**
  * Parsing AI response για ομαδοποίηση
  */
-function parseAIResponse(response) {
+function parseAIResponse(response, tabData = null) {
     try {
         console.log('🔍 Parsing AI response...');
         console.log('📥 Raw AI response:', response);
@@ -6871,9 +8343,35 @@ function parseAIResponse(response) {
             console.log('✅ JSON parsed successfully');
             console.log('📊 Parsed groups:', parsed);
             
-            // Log κάθε group ξεχωριστά
+            // Log κάθε group ξεχωριστά με λεπτομέρειες για τα tabs
             parsed.forEach((group, index) => {
                 console.log(`📁 Group ${index + 1}: "${group.name}" with tabs: [${group.tabIndices?.join(', ') || 'none'}]`);
+                
+                // Λεπτομερές log για κάθε group που δημιούργησε το AI
+                if (group.tabIndices && group.tabIndices.length > 0) {
+                    console.log(`🤖 [AI Grouping Decision] Group "${group.name}" contains tabs:`, group.tabIndices);
+                    console.log(`🤖 [AI Reasoning] The AI decided these tabs belong together because they share similar themes/topics`);
+                    
+                    // Αν έχουμε tab data, δείχνουμε τα titles των tabs που ομαδοποιεί το AI
+                    if (tabData && tabData.length > 0) {
+                        const groupedTabs = group.tabIndices.map(tabIndex => {
+                            const tab = tabData[tabIndex];
+                            return tab ? {
+                                index: tabIndex,
+                                title: tab.title,
+                                url: tab.url,
+                                domain: tab.domain
+                            } : null;
+                        }).filter(Boolean);
+                        
+                        console.log(`🤖 [AI Grouping Details] Tabs that AI grouped together in "${group.name}":`);
+                        groupedTabs.forEach(tab => {
+                            console.log(`   📄 Tab ${tab.index}: "${tab.title}" (${tab.domain})`);
+                        });
+                        
+                        console.log(`🤖 [AI Grouping Summary] AI created group "${group.name}" with ${groupedTabs.length} tabs that share similar content/themes`);
+                    }
+                }
             });
             
             return parsed;
@@ -7083,15 +8581,17 @@ async function performAIGroupingInContent(tabData) {
         // Δημιουργία prompt
         const prompt = createGroupingPrompt(tabData);
         console.log('Content script: Prompt created, length:', prompt.length);
+        console.log('🤖 [AI Prompt] Sending this prompt to AI for grouping:', prompt.substring(0, 500) + '...');
         
         // Εκτέλεση AI grouping
         console.log('Content script: Executing AI prompt...');
         const response = await session.prompt(prompt);
         console.log('Content script: AI response received:', typeof response, response?.length || 'no length');
+        console.log('🤖 [AI Response] Raw AI response for grouping:', response);
         
         // Parse response
         console.log('Content script: Parsing AI response...');
-        const groups = parseAIResponse(response);
+        const groups = parseAIResponse(response, tabData);
         console.log('Content script: Groups parsed successfully:', groups.length);
         
         return groups;

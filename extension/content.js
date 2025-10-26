@@ -206,7 +206,7 @@ function resolveSummarizerApi() {
 /**
  * AI Grouping function για Chrome AI APIs
  */
-async function performAIGrouping(tabData) {
+async function performAIGrouping(prompt) {
     try {
         console.log('Content script: Starting AI grouping...');
         const languageModelApi = resolveLanguageModelApi();
@@ -255,39 +255,33 @@ async function performAIGrouping(tabData) {
         }
         console.log('Content script: Language model session created successfully');
         
-        // Δημιουργία prompt
-        const prompt = `Είσαι ένας βοηθός οργάνωσης tabs. 
-Δεδομένων των παρακάτω tabs με τίτλους και περιεχόμενο, δημιούργησε μια JSON λίστα με ομάδες θεμάτων (μέγιστο 6 ομάδες).
-Κάθε ομάδα πρέπει να περιλαμβάνει ένα όνομα και έναν πίνακα με τα indices των tabs.
-
-Tabs:
-${tabData.map(tab => 
-    `Tab ${tab.index}: "${tab.title}" (${tab.url}) - ${tab.content.substring(0, 100)}...`
-).join('\n')}
-
-Απάντησε ΜΟΝΟ με JSON σε αυτή τη μορφή:
-[
-  {
-    "name": "Όνομα Ομάδας",
-    "tabIndices": [0, 1, 2]
-  }
-]`;
-        
-        console.log('Content script: Prompt created, length:', prompt.length);
+        console.log('Content script: Using provided prompt, length:', prompt.length);
         
         // Εκτέλεση AI grouping
         console.log('Content script: Executing AI prompt...');
         const response = await session.prompt(prompt);
         console.log('Content script: AI response received:', typeof response, response?.length || 'no length');
+        console.log('🤖 [AI Raw Response] Full AI response:', response);
         
         // Parse response
         console.log('Content script: Parsing AI response...');
-        const jsonMatch = response.match(/\[[\s\S]*\]/);
+        console.log('Content script: Raw AI response:', response);
+        
+        const jsonMatch = response.match(/\{[\s\S]*\}/);
         if (jsonMatch) {
-            const groups = JSON.parse(jsonMatch[0]);
-            console.log('Content script: Groups parsed successfully:', groups.length);
-            return groups;
+            const parsed = JSON.parse(jsonMatch[0]);
+            console.log('Content script: Parsed JSON:', parsed);
+            
+            // Μετατροπή σε σωστό format για το background script
+            const result = {
+                keywords: parsed.keywords || []
+            };
+            
+            console.log('Content script: Converted to background format:', result);
+            return result;
         } else {
+            console.error('Content script: No valid JSON found in AI response');
+            console.error('Content script: Full response:', response);
             throw new Error('No valid JSON found in AI response');
         }
         
@@ -396,16 +390,56 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     
     switch (message.type) {
         case 'PERFORM_AI_GROUPING':
-            performAIGrouping(message.data)
-                .then(result => {
-                    console.log('Content script: AI grouping successful:', result);
-                    sendResponse({ success: true, result: result });
-                })
-                .catch(error => {
-                    console.error('Content script: AI grouping failed:', error);
-                    sendResponse({ success: false, error: error.message });
+        case 'AI_GROUPING_REQUEST':
+            console.log('Content script: Received AI grouping request');
+            console.log('Content script: Message data type:', typeof message.data);
+            console.log('Content script: Message data length:', message.data?.length || 'no length');
+            console.log('Content script: AITabCompanion available:', typeof window.AITabCompanion !== 'undefined');
+            console.log('Content script: performAIGrouping available:', typeof window.AITabCompanion?.performAIGrouping);
+            
+            if (typeof window.AITabCompanion !== 'undefined' && window.AITabCompanion.performAIGrouping) {
+                console.log('Content script: Using AITabCompanion.performAIGrouping');
+                const prompt = message.prompt || message.data;
+                performAIGrouping(prompt)
+                    .then(result => {
+                        console.log('Content script: AI grouping successful:', result);
+                        console.log('Content script: AI grouping result type:', typeof result);
+                        
+                        // Send response back to background script
+                        chrome.runtime.sendMessage({
+                            type: 'AI_GROUPING_RESPONSE',
+                            success: true,
+                            result: result
+                        });
+                        
+                        sendResponse({ success: true, result: result });
+                    })
+                    .catch(error => {
+                        console.error('Content script: AI grouping failed:', error);
+                        
+                        // Send error response back to background script
+                        chrome.runtime.sendMessage({
+                            type: 'AI_GROUPING_RESPONSE',
+                            success: false,
+                            error: error.message
+                        });
+                        
+                        sendResponse({ success: false, error: error.message });
+                    });
+                return true; // Keep message channel open for async response
+            } else {
+                console.error('Content script: AITabCompanion not available');
+                const error = 'AITabCompanion not available in content script';
+                
+                // Send error response back to background script
+                chrome.runtime.sendMessage({
+                    type: 'AI_GROUPING_RESPONSE',
+                    success: false,
+                    error: error
                 });
-            return true; // Keep message channel open for async response
+                
+                sendResponse({ success: false, error });
+            }
             
         case 'PERFORM_AI_SUMMARIZATION':
             performAISummarization(message.data)
@@ -427,6 +461,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 // Export functions για χρήση από background script
 if (typeof window !== 'undefined') {
+    console.log('Content script: Setting up AITabCompanion...');
     window.AITabCompanion = {
         extractPageContent,
         extractAllPageData,
@@ -435,4 +470,5 @@ if (typeof window !== 'undefined') {
         performAIGrouping,
         performAISummarization
     };
+    console.log('Content script: AITabCompanion setup complete:', Object.keys(window.AITabCompanion));
 }
