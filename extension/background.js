@@ -3055,8 +3055,10 @@ async function createTabGroups(aiGroups, tabData) {
                                 
                                 group.chromeGroupId = groupId;
                                 group.autoSuspended = false;
-                                group.lastActive = Date.now();
-                                recordGroupActivity(groupId, { resetSuspension: false });
+                                // Set lastActive to past so it can be suspended if user doesn't visit it
+                                group.lastActive = 0; // Never visited
+                                const initialState = { lastActive: 0, suspended: false };
+                                groupActivityState.set(groupId, initialState);
                             } else {
                                 console.log(`⏭️ Skipping group "${group.name}" - no tabs passed final check`);
                             }
