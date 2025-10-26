@@ -2311,6 +2311,44 @@ async function performFusionScoring(deterministicGroups, aiSuggestions, tabDataF
 }
 
 /**
+ * Infer taxonomy from AI keywords
+ * Uses AI keywords to determine if a tab belongs to a specific category
+ */
+function inferTaxonomyFromAIKeywords(aiSuggestion, tab) {
+    if (!aiSuggestion || !aiSuggestion.keywords || aiSuggestion.keywords.length === 0) {
+        return null; // No AI keywords, use fallback
+    }
+    
+    const aiKeywords = aiSuggestion.keywords.map(kw => kw.toLowerCase());
+    
+    // Medical/Research taxonomy
+    const medicalKeywords = ['medical', 'health', 'research', 'pubmed', 'nejm', 'clinical', 'treatment', 'patient', 'disease', 'journal', 'medicine'];
+    if (aiKeywords.some(kw => medicalKeywords.some(mk => kw.includes(mk)))) {
+        return 'medical';
+    }
+    
+    // Technology taxonomy
+    const techKeywords = ['ai', 'artificial intelligence', 'tech', 'software', 'computer', 'digital', 'innovation', 'coding', 'development', 'openai', 'google ai'];
+    if (aiKeywords.some(kw => techKeywords.some(tk => kw.includes(tk)))) {
+        return 'technology';
+    }
+    
+    // Gaming taxonomy
+    const gamingKeywords = ['gaming', 'game', 'play', 'fifa', 'sport', 'team', 'fc', 'ultimate', 'player', 'ratings', 'squad', 'futbin'];
+    if (aiKeywords.some(kw => gamingKeywords.some(gk => kw.includes(gk)))) {
+        return 'gaming';
+    }
+    
+    // News/Blog taxonomy
+    const newsKeywords = ['news', 'blog', 'article', 'update', 'press', 'latest'];
+    if (aiKeywords.some(kw => newsKeywords.some(nk => kw.includes(nk)))) {
+        return 'news';
+    }
+    
+    return null; // No match, use fallback taxonomy
+}
+
+/**
  * Ελέγχει αν δύο tabs έχουν shared keywords (medical, research, technology, etc.)
  */
 function checkSharedKeywords(tabI, tabJ) {
@@ -2402,10 +2440,16 @@ function calculateFusionScore(i, j, aiSuggestions, tabDataForAI, weights) {
         }
     }
     
-    // Taxonomy agreement
-    const taxI = tabI.primaryTopic || 'general';
-    const taxJ = tabJ.primaryTopic || 'general';
+    // Taxonomy agreement - USE AI KEYWORDS IF AVAILABLE
     let taxAgree = 0;
+    
+    // First, try to infer taxonomy from AI keywords if available
+    const aiITax = inferTaxonomyFromAIKeywords(aiI, tabI);
+    const aiJTax = inferTaxonomyFromAIKeywords(aiJ, tabJ);
+    
+    // Use AI-inferred taxonomy if available, otherwise fall back to primaryTopic
+    const taxI = aiITax || tabI.primaryTopic || 'general';
+    const taxJ = aiJTax || tabJ.primaryTopic || 'general';
     
     // Check if tabs belong to same category (medical, technology, etc.)
     if (taxI === taxJ && taxI !== 'general') {
