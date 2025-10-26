@@ -2276,6 +2276,15 @@ async function performFusionScoring(deterministicGroups, aiSuggestions, tabDataF
             
             const fusionScore = calculateFusionScore(i, j, aiSuggestions, tabDataForAI, weights);
             
+            // Log all medical/research tabs for debugging
+            const tabI = tabDataForAI[i];
+            const tabJ = tabDataForAI[j];
+            if (tabI.title && tabJ.title && 
+                (tabI.title.toLowerCase().includes('medical') || tabI.title.toLowerCase().includes('research') || tabI.title.toLowerCase().includes('nejm') || tabI.title.toLowerCase().includes('pubmed')) &&
+                (tabJ.title.toLowerCase().includes('medical') || tabJ.title.toLowerCase().includes('research') || tabJ.title.toLowerCase().includes('nejm') || tabJ.title.toLowerCase().includes('pubmed'))) {
+                console.log(`🏥 [Medical Test] Tabs ${i}-${j}: "${tabI.title}" vs "${tabJ.title}" → score: ${fusionScore.toFixed(3)}`);
+            }
+            
             if (fusionScore >= joinThreshold) {
                 console.log(`🔗 [Fusion] High similarity detected: tabs ${i}-${j}, score: ${fusionScore.toFixed(3)} (threshold: ${joinThreshold})`);
                 
