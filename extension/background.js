@@ -2073,19 +2073,25 @@ function createShardPrompt(shardTabs) {
     const tabsInfo = shardTabs.map((tab, index) => {
         const cleanTitle = tab.title || 'Untitled';
         const cleanUrl = tab.url || '';
-        return `${index}: "${cleanTitle}" - ${cleanUrl}`;
+        const domain = cleanUrl ? new URL(cleanUrl).hostname.replace('www.', '') : '';
+        return `${index}: "${cleanTitle}" [${domain}] - ${cleanUrl}`;
     }).join('\n');
     
-    return `Analyze these tabs and generate 3-5 keywords per tab describing their main topic/purpose.
+    return `Analyze these browser tabs and generate 3-5 keywords per tab describing their main topic/purpose.
+Pay attention to both titles AND URLs to infer topics.
+
 Return ONLY valid JSON in this format: {"keywords":[{"index":0,"keywords":["keyword1","keyword2"]}]}
 
 Tabs:
 ${tabsInfo}
 
 Requirements:
-- Return ONLY the JSON object
-- Use clear, relevant keywords
-- Keywords should be 1-2 words
+- Return ONLY the JSON object (no markdown, no extra text)
+- Use clear, relevant keywords (1-2 words each)
+- Consider both title AND domain/URL context
+- Examples: medical sites → use "medical", "health", "research"
+- Examples: ai sites → use "ai", "artificial intelligence", "tech"
+- Examples: gaming sites → use "gaming", "game", "sports"
 - Focus on main topics, not technical details`;
 }
 
