@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="el">
+<html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -14,7 +14,7 @@
                 <img src="icons/icon48.png" alt="AI Tab Companion" class="logo-icon">
                 <h1>AI Tab Companion</h1>
             </div>
-            <p class="subtitle">Έξυπνη διαχείριση tabs με AI</p>
+            <p class="subtitle">Smart AI-powered tab management</p>
         </header>
 
         <!-- Main Content -->
@@ -24,18 +24,18 @@
                 <div class="scan-button-container">
                     <button id="scan-tabs-btn" class="scan-btn">
                         <span class="btn-icon">🔍</span>
-                        Σκάναρε Tabs
+                        Scan Tabs
                     </button>
                 </div>
-                <p class="help-text">Κάνε κλικ για να αναλύσω τα ανοιχτά tabs με AI</p>
-                <p class="help-text">Τα αποτελέσματα θα εμφανιστούν σε popup messages</p>
+                <p class="help-text">Click to analyze your open tabs with AI</p>
+                <p class="help-text">Results will appear in popup messages</p>
             </div>
 
             <!-- Results State -->
             <div id="results" class="results hidden">
                 <div class="results-header">
-                    <h2>Αποτελέσματα Ανάλυσης</h2>
-                    <button id="rescan-btn" class="rescan-btn">🔄 Νέο Σκάναρισμα</button>
+                    <h2>Analysis Results</h2>
+                    <button id="rescan-btn" class="rescan-btn">🔄 Rescan</button>
                 </div>
                 
                 <div id="groups-container" class="groups-container">
@@ -44,10 +44,10 @@
 
                 <div class="actions">
                     <button id="close-selected-btn" class="action-btn close-btn" disabled>
-                        🗑️ Κλείσε Επιλεγμένα
+                        🗑️ Close Selected
                     </button>
                     <button id="export-summary-btn" class="action-btn export-btn">
-                        📤 Εξαγωγή Περίληψης
+                        📤 Export Summary
                     </button>
                 </div>
             </div>
@@ -55,9 +55,9 @@
             <!-- Error State -->
             <div id="error-state" class="error-state hidden">
                 <div class="error-icon">⚠️</div>
-                <h3>Σφάλμα</h3>
-                <p id="error-message">Παρουσιάστηκε ένα σφάλμα κατά την ανάλυση</p>
-                <button id="retry-btn" class="retry-btn">🔄 Δοκίμασε Ξανά</button>
+                <h3>Error</h3>
+                <p id="error-message">An error occurred during analysis</p>
+                <button id="retry-btn" class="retry-btn">🔄 Try Again</button>
             </div>
         </main>
 

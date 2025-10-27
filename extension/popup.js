@@ -80,18 +80,18 @@ async function startScanning() {
     try {
         const permissionResult = await requestAllHostPermissions();
         if (!permissionResult.granted) {
-            showTemporaryMessage('Πρέπει να δώσεις πρόσβαση σε όλα τα sites για να διαβαστούν τα tabs.');
+            showTemporaryMessage('You need to grant access to all sites to read tabs.');
             return;
         }
         
         isScanning = true;
-        alert('🔍 AI Tab Companion: Αρχίζει η ανάλυση των tabs...');
+        alert('🔍 AI Tab Companion: Starting tabs analysis...');
         
-        // Αποστολή μηνύματος στο background script
+        // Send message to background script
         const response = await sendMessageToBackground('SCAN_TABS');
         
         if (response.success) {
-            alert('✅ AI Tab Companion: Βρέθηκαν ' + response.tabCount + ' tabs. Περίμενε την AI ανάλυση...');
+            alert('✅ AI Tab Companion: Found ' + response.tabCount + ' tabs. Waiting for AI analysis...');
             
             // Περιμένουμε τα αποτελέσματα
             await waitForResults();
@@ -177,7 +177,7 @@ async function waitForResults() {
         }
     }
     
-    throw new Error('Timeout waiting for AI analysis results (δοκίμασε ξανά – η πρώτη εκτέλεση μπορεί να πάρει έως 4 λεπτά)');
+    throw new Error('Timeout waiting for AI analysis results (try again – first run may take up to 4 minutes)');
 }
 
 /**
@@ -200,10 +200,10 @@ function showInitialState() {
  * Εμφάνιση results με alert
  */
 function showResultsWithAlert() {
-    let message = '🎉 AI Tab Companion: Ανάλυση Ολοκληρώθηκε!\n\n';
+    let message = '🎉 AI Tab Companion: Analysis Complete!\n\n';
     
     if (currentGroups && currentGroups.length > 0) {
-        message += `📊 Βρέθηκαν ${currentGroups.length} ομάδες tabs:\n\n`;
+        message += `📊 Found ${currentGroups.length} tab groups:\n\n`;
         
         currentGroups.forEach((group, index) => {
             message += `${index + 1}. ${group.name} (${group.tabIndices.length} tabs)\n`;
@@ -213,10 +213,10 @@ function showResultsWithAlert() {
             message += '\n';
         });
         
-        message += '📁 Θέλεις να δημιουργήσεις ομάδες tabs με AI;\n';
-        message += 'Κάνε κλικ "OK" για να δεις τις επιλογές!';
+        message += '📁 Would you like to create tab groups with AI?\n';
+        message += 'Click "OK" to see the options!';
     } else {
-        message += '❌ Δεν βρέθηκαν ομάδες tabs';
+        message += '❌ No tab groups found';
     }
     
     // Εμφάνιση αποτελεσμάτων και μετά επιλογές για κλείσιμο
@@ -234,12 +234,12 @@ function showResultsWithAlert() {
 async function showGroupingOptions() {
     if (!currentGroups || currentGroups.length === 0) return;
     
-    let message = '📁 AI Tab Companion: Επιλογές για ομαδοποίηση tabs\n\n';
-    message += 'Θα αναλύσω τα ανοιχτά tabs σου και θα δημιουργήσω ομάδες βάσει του περιεχομένου τους.\n\n';
-    message += 'Αν βρω tabs με παρόμοιο περιεχόμενο, θα τα ομαδοποιήσω με κατάλληλο όνομα.\n';
-    message += 'Αν δεν βρω κοινά θέματα, θα εμφανίσω μήνυμα.\n\n';
-    message += 'Θέλεις να προχωρήσω με την ανάλυση;\n';
-    message += 'Κάνε κλικ "OK" για να προχωρήσω!';
+    let message = '📁 AI Tab Companion: Tab Grouping Options\n\n';
+    message += 'I will analyze your open tabs and create groups based on their content.\n\n';
+    message += 'If I find tabs with similar content, I will group them with an appropriate name.\n';
+    message += 'If I do not find common topics, I will display a message.\n\n';
+    message += 'Would you like to proceed with the analysis?\n';
+    message += 'Click "OK" to proceed!';
     
     const proceed = confirm(message);
     
@@ -263,7 +263,7 @@ async function createTabGroups(groups) {
         const groupsWithMultipleTabs = groups.filter(group => group.tabIndices.length > 1);
         
         if (groupsWithMultipleTabs.length === 0) {
-            alert('ℹ️ AI Tab Companion: Δεν βρέθηκαν tabs με παρόμοιο περιεχόμενο για ομαδοποίηση.\n\nΌλα τα tabs έχουν διαφορετικό περιεχόμενο και δεν μπορούν να ομαδοποιηθούν.');
+            alert('ℹ️ AI Tab Companion: No tabs with similar content found for grouping.\n\nAll tabs have different content and cannot be grouped.');
             return;
         }
         
@@ -290,12 +290,12 @@ async function createTabGroups(groups) {
         }
         
         // Εμφάνιση αποτελέσματος
-        let resultMessage = `✅ AI Tab Companion: Δημιουργήθηκαν ${createdGroups.length} ομάδες!\n\n`;
-        resultMessage += 'Ομαδοποιήθηκαν tabs με παρόμοιο περιεχόμενο:\n';
+        let resultMessage = `✅ AI Tab Companion: Created ${createdGroups.length} groups!\n\n`;
+        resultMessage += 'Grouped tabs with similar content:\n';
         createdGroups.forEach(groupName => {
             resultMessage += `• ${groupName}\n`;
         });
-        resultMessage += '\n💡 Τα tabs τώρα είναι οργανωμένα σε ομάδες!';
+        resultMessage += '\n💡 Your tabs are now organized into groups!';
         
         alert(resultMessage);
         
@@ -396,7 +396,7 @@ function renderGroups() {
     elements.groupsContainer.innerHTML = '';
     
     if (!currentGroups || currentGroups.length === 0) {
-        elements.groupsContainer.innerHTML = '<p class="no-groups">Δεν βρέθηκαν ομάδες tabs</p>';
+        elements.groupsContainer.innerHTML = '<p class="no-groups">No tab groups found</p>';
         return;
     }
     
@@ -548,11 +548,11 @@ async function requestGroupSummary(groupIndex, contentElement) {
                 </ul>
             `;
         } else {
-            const errorText = response?.error || 'Άγνωστο σφάλμα';
-            summaryDiv.innerHTML = `<p class="summary-error">Δεν ήταν δυνατή η δημιουργία περίληψης: ${errorText}</p>`;
+            const errorText = response?.error || 'Unknown error';
+            summaryDiv.innerHTML = `<p class="summary-error">Unable to create summary: ${errorText}</p>`;
         }
     } catch (error) {
-        summaryDiv.innerHTML = `<p class="summary-error">Σφάλμα κατά την περίληψη: ${error.message}</p>`;
+        summaryDiv.innerHTML = `<p class="summary-error">Error during summary: ${error.message}</p>`;
     } finally {
         group._summaryRequestInFlight = false;
     }
