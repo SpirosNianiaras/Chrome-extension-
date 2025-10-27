@@ -1888,8 +1888,17 @@ async function performAIEnsembleFusion(deterministicGroups, tabDataForAI) {
     await clearAllCache();
     
     const FUSION_WEIGHTS = { det: 0.65, ai: 0.25, tax: 0.10 }; // Σφιχτά βάρη
-    const FUSION_JOIN_THRESHOLD = 0.25; // Εξαιρετικά χαμηλό threshold για S2 test
-    const FUSION_CENTROID_THRESHOLD = 0.35; // Εξαιρετικά χαμηλό threshold για S2 test
+    
+    // Adaptive thresholds per category
+    const ADAPTIVE_THRESHOLDS = {
+        medical: 0.18,    // Lower for medical (strong domain similarities)
+        technology: 0.20, // Lower for AI/tech content
+        gaming: 0.25,     // Medium for gaming
+        news: 0.30,       // Higher for news (avoid over-merge)
+        general: 0.25     // Default
+    };
+    
+    const FUSION_CENTROID_THRESHOLD = 0.35;
     const SHARD_SIZE = 12; // Max 12 tabs per shard
     const SHARD_TIMEOUT = 12000; // 12s per shard
     const OVERALL_BUDGET = 15000; // 15s total budget
@@ -1962,7 +1971,7 @@ async function performAIEnsembleFusion(deterministicGroups, tabDataForAI) {
         aiSuggestions, 
         tabDataForAI,
         FUSION_WEIGHTS,
-        FUSION_JOIN_THRESHOLD,
+        ADAPTIVE_THRESHOLDS,
         FUSION_CENTROID_THRESHOLD
     );
     
@@ -2254,7 +2263,7 @@ async function executeAIGroupingWithTimeout(prompt, timeout) {
 /**
  * Εκτελεί fusion scoring
  */
-async function performFusionScoring(deterministicGroups, aiSuggestions, tabDataForAI, weights, joinThreshold, centroidThreshold) {
+async function performFusionScoring(deterministicGroups, aiSuggestions, tabDataForAI, weights, adaptiveThresholds, centroidThreshold) {
     console.log('🎯 [Fusion Scoring] Starting fusion scoring calculation...');
     
     const fusionGroups = [...deterministicGroups];
@@ -2267,23 +2276,40 @@ async function performFusionScoring(deterministicGroups, aiSuggestions, tabDataF
             
             const fusionScore = calculateFusionScore(i, j, aiSuggestions, tabDataForAI, weights);
             
-            // Log all medical/research tabs for debugging
+            // Get tabs for analysis
             const tabI = tabDataForAI[i];
             const tabJ = tabDataForAI[j];
+            
+            // Log all medical/research tabs for debugging
             if (tabI.title && tabJ.title && 
                 (tabI.title.toLowerCase().includes('medical') || tabI.title.toLowerCase().includes('research') || tabI.title.toLowerCase().includes('nejm') || tabI.title.toLowerCase().includes('pubmed')) &&
                 (tabJ.title.toLowerCase().includes('medical') || tabJ.title.toLowerCase().includes('research') || tabJ.title.toLowerCase().includes('nejm') || tabJ.title.toLowerCase().includes('pubmed'))) {
                 console.log(`🏥 [Medical Test] Tabs ${i}-${j}: "${tabI.title}" vs "${tabJ.title}" → score: ${fusionScore.toFixed(3)}`);
             }
             
-            if (fusionScore >= joinThreshold) {
-                console.log(`🔗 [Fusion] High similarity detected: tabs ${i}-${j}, score: ${fusionScore.toFixed(3)} (threshold: ${joinThreshold})`);
+            // Adaptive threshold based on category
+            const categoryI = inferCategory(tabI);
+            const categoryJ = inferCategory(tabJ);
+            const category = (categoryI === categoryJ && categoryI !== 'general') ? categoryI : 'general';
+            const adaptiveThreshold = adaptiveThresholds && adaptiveThresholds[category] ? adaptiveThresholds[category] : (adaptiveThresholds?.general || 0.25);
+            
+            if (fusionScore >= adaptiveThreshold) {
+                console.log(`🔗 [Fusion] High similarity detected: tabs ${i}-${j}, score: ${fusionScore.toFixed(3)} (threshold: ${adaptiveThreshold}) [category: ${category}]`);
                 
                 // Merge tabs
                 const groupA = findGroupContaining(fusionGroups, i);
                 const groupB = findGroupContaining(fusionGroups, j);
                 
                 if (groupA && groupB && groupA !== groupB) {
+                    // Check for over-merge: if groups are too large, be more strict
+                    const wouldBeTooLarge = (groupA.tabIndices.length + groupB.tabIndices.length) > 15;
+                    const shouldMerge = !wouldBeTooLarge || fusionScore >= 0.5; // Higher threshold for large groups
+                    
+                    if (!shouldMerge) {
+                        console.log(`⏸️ [Fusion] Skipping merge to avoid over-merge: ${groupA.tabIndices.length} + ${groupB.tabIndices.length} tabs (score: ${fusionScore.toFixed(3)})`);
+                        continue;
+                    }
+                    
                     console.log(`🔗 [Fusion] Merging groups: ${groupA.name || 'Unknown'} + ${groupB.name || 'Unknown'}`);
                     
                     // Merge groups
@@ -2308,6 +2334,48 @@ async function performFusionScoring(deterministicGroups, aiSuggestions, tabDataF
     
     // Centroid-based merging
     return performCentroidFusion(fusionGroups, centroidThreshold);
+}
+
+/**
+ * Infers category from tab content (title, url, domain)
+ * Used for adaptive threshold selection
+ */
+function inferCategory(tab) {
+    if (!tab) return 'general';
+    
+    const title = (tab.title || '').toLowerCase();
+    const url = (tab.url || '').toLowerCase();
+    const domain = (tab.domain || '').toLowerCase();
+    const allText = title + ' ' + url + ' ' + domain;
+    
+    // Medical/Health category
+    if (allText.includes('medical') || allText.includes('health') || allText.includes('pubmed') || 
+        allText.includes('nejm') || allText.includes('medicalnewstoday') || allText.includes('research') ||
+        allText.includes('clinical') || allText.includes('treatment') || allText.includes('patient')) {
+        return 'medical';
+    }
+    
+    // Technology/AI category
+    if (allText.includes('ai') || allText.includes('artificial intelligence') || allText.includes('tech') ||
+        allText.includes('openai') || allText.includes('techcrunch') || allText.includes('theverge') ||
+        allText.includes('google ai') || allText.includes('innovation') || allText.includes('software')) {
+        return 'technology';
+    }
+    
+    // Gaming category
+    if (allText.includes('gaming') || allText.includes('game') || allText.includes('fifa') ||
+        allText.includes('futbin') || allText.includes('ultimate team') || allText.includes('fc') ||
+        allText.includes('sports') || allText.includes('player') || allText.includes('squad')) {
+        return 'gaming';
+    }
+    
+    // News category
+    if (allText.includes('news') || allText.includes('blog') || allText.includes('article') ||
+        allText.includes('update') || allText.includes('press') || allText.includes('latest')) {
+        return 'news';
+    }
+    
+    return 'general';
 }
 
 /**
