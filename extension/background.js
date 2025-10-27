@@ -1894,6 +1894,7 @@ async function performAIEnsembleFusion(deterministicGroups, tabDataForAI) {
         medical: 0.18,    // Lower for medical (strong domain similarities)
         technology: 0.20, // Lower for AI/tech content
         gaming: 0.25,     // Medium for gaming
+        shopping: 0.28,   // Higher for shopping (avoid over-merge)
         news: 0.30,       // Higher for news (avoid over-merge)
         general: 0.25     // Default
     };
@@ -2291,10 +2292,31 @@ async function performFusionScoring(deterministicGroups, aiSuggestions, tabDataF
             const categoryI = inferCategory(tabI);
             const categoryJ = inferCategory(tabJ);
             const category = (categoryI === categoryJ && categoryI !== 'general') ? categoryI : 'general';
+            
+            // Extra safety check: don't merge conflicting categories even with high score
+            const conflictingCategories = [
+                ['technology', 'gaming'],
+                ['technology', 'medical'],
+                ['gaming', 'medical'],
+                ['technology', 'shopping'],
+                ['gaming', 'shopping']
+            ];
+            
+            const isConflicting = conflictingCategories.some(([cat1, cat2]) => 
+                (categoryI === cat1 && categoryJ === cat2) || 
+                (categoryI === cat2 && categoryJ === cat1)
+            );
+            
             const adaptiveThreshold = adaptiveThresholds && adaptiveThresholds[category] ? adaptiveThresholds[category] : (adaptiveThresholds?.general || 0.25);
             
             if (fusionScore >= adaptiveThreshold) {
                 console.log(`🔗 [Fusion] High similarity detected: tabs ${i}-${j}, score: ${fusionScore.toFixed(3)} (threshold: ${adaptiveThreshold}) [category: ${category}]`);
+                
+                // Block merge for conflicting categories unless score is very high
+                if (isConflicting && fusionScore < 0.5) {
+                    console.log(`🚫 [Fusion] Blocked merge of conflicting categories: ${categoryI} vs ${categoryJ} (score: ${fusionScore.toFixed(3)})`);
+                    continue;
+                }
                 
                 // Merge tabs
                 const groupA = findGroupContaining(fusionGroups, i);
@@ -2367,6 +2389,13 @@ function inferCategory(tab) {
         allText.includes('futbin') || allText.includes('ultimate team') || allText.includes('fc') ||
         allText.includes('sports') || allText.includes('player') || allText.includes('squad')) {
         return 'gaming';
+    }
+    
+    // Shopping category
+    if (allText.includes('amazon') || allText.includes('target') || allText.includes('best buy') ||
+        allText.includes('ebay') || allText.includes('shop') || allText.includes('purchase') ||
+        allText.includes('buy') || allText.includes('cart') || allText.includes('checkout')) {
+        return 'shopping';
     }
     
     // News category
