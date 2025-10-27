@@ -1482,9 +1482,9 @@ function shouldMergeProvisional(taxonomy1, tokens1, taxonomy2, tokens2) {
         return true;
     }
     
-    // High token overlap - χαμηλότερο threshold
+    // High token overlap - πιο αυστηρό threshold για αποφυγή over-merge
     const overlap = calculateTokenOverlap(tokens1.tokens, tokens2.tokens);
-    if (overlap > 0.2) { // Μειώθηκε από 0.3 σε 0.2
+    if (overlap > 0.35) { // Increased from 0.2 to 0.35 to prevent over-merge
         console.log(`🔗 [Merge] High token overlap: ${(overlap * 100).toFixed(1)}%`);
         return true;
     }
@@ -2302,8 +2302,8 @@ async function performFusionScoring(deterministicGroups, aiSuggestions, tabDataF
                 
                 if (groupA && groupB && groupA !== groupB) {
                     // Check for over-merge: if groups are too large, be more strict
-                    const wouldBeTooLarge = (groupA.tabIndices.length + groupB.tabIndices.length) > 15;
-                    const shouldMerge = !wouldBeTooLarge || fusionScore >= 0.5; // Higher threshold for large groups
+                    const wouldBeTooLarge = (groupA.tabIndices.length + groupB.tabIndices.length) > 8; // Reduced from 15 to 8
+                    const shouldMerge = !wouldBeTooLarge || fusionScore >= 0.6; // Higher threshold for large groups (increased from 0.5 to 0.6)
                     
                     if (!shouldMerge) {
                         console.log(`⏸️ [Fusion] Skipping merge to avoid over-merge: ${groupA.tabIndices.length} + ${groupB.tabIndices.length} tabs (score: ${fusionScore.toFixed(3)})`);
