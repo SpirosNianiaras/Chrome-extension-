@@ -203,30 +203,21 @@ function resolveSummarizerApi() {
     );
 }
 
-/**
- * AI Grouping function για Chrome AI APIs
- */
-async function performAIGrouping(prompt) {
-    try {
-        console.log('Content script: Starting AI grouping...');
-        const languageModelApi = resolveLanguageModelApi();
-        
-        if (!languageModelApi) {
-            throw new Error('Language Model API not available - Chrome AI APIs not accessible');
-        }
-        
-        console.log('Content script: Language Model API detected');
-        
-        // Έλεγχος διαθεσιμότητας Language Model API
+let __lmSessionPromise = null;
+
+async function getLanguageModelSession() {
+    const languageModelApi = resolveLanguageModelApi();
+    if (!languageModelApi) throw new Error('Language Model API not available - Chrome AI APIs not accessible');
+    if (__lmSessionPromise) return __lmSessionPromise;
+    __lmSessionPromise = (async () => {
+        // Availability (best-effort)
         if (typeof languageModelApi.availability === 'function') {
             try {
                 const availability = await languageModelApi.availability();
                 console.log('Content script: LanguageModel availability:', availability);
-                
                 if (availability === 'unavailable') {
                     throw new Error('Language Model API is unavailable on this device');
                 }
-                
                 if ((availability === 'downloadable' || availability === 'downloading') && !(navigator.userActivation && navigator.userActivation.isActive)) {
                     throw new Error('Language Model requires user activation to download. Κάνε κλικ στη σελίδα και δοκίμασε ξανά.');
                 }
@@ -234,7 +225,6 @@ async function performAIGrouping(prompt) {
                 console.warn('Content script: LanguageModel.availability() failed, continuing optimistically:', availabilityError);
             }
         }
-        
         let session;
         try {
             session = await languageModelApi.create({
@@ -249,19 +239,48 @@ async function performAIGrouping(prompt) {
             console.warn('Content script: LanguageModel.create with monitor failed, retrying without options:', createWithMonitorError);
             session = await languageModelApi.create();
         }
-        
-        if (!session) {
-            throw new Error('Failed to create language model session');
-        }
-        console.log('Content script: Language model session created successfully');
+        if (!session) throw new Error('Failed to create language model session');
+        console.log('Content script: Language model session created and cached');
+        return session;
+    })();
+    return __lmSessionPromise;
+}
+
+async function ensureLanguageModelReady() {
+    try {
+        await getLanguageModelSession();
+        return true;
+    } catch (e) {
+        console.warn('Content script: ensureLanguageModelReady failed:', e?.message || e);
+        return false;
+    }
+}
+
+/**
+ * AI Grouping function για Chrome AI APIs
+ */
+async function performAIGrouping(prompt) {
+    try {
+        console.log('Content script: Starting AI grouping...');
+        const session = await getLanguageModelSession();
         
         console.log('Content script: Using provided prompt, length:', prompt.length);
         
         // Εκτέλεση AI grouping
         console.log('Content script: Executing AI prompt...');
-        const response = await session.prompt(prompt);
-        console.log('Content script: AI response received:', typeof response, response?.length || 'no length');
-        console.log('🤖 [AI Raw Response] Full AI response:', response);
+        const PROMPT_TIMEOUT_MS = 10000; // 10s guard to avoid background timeouts
+        let response;
+        try {
+            response = await Promise.race([
+                session.prompt(prompt),
+                new Promise((_, reject) => setTimeout(() => reject(new Error('AI prompt timeout')), PROMPT_TIMEOUT_MS))
+            ]);
+            console.log('Content script: AI response received:', typeof response, response?.length || 'no length');
+            console.log('🤖 [AI Raw Response] Full AI response:', response);
+        } catch (e) {
+            console.warn('🤖 [AI] Prompt failed or timed out, falling back to heuristic keywords:', e?.message || e);
+            return buildHeuristicKeywordsFromPrompt(prompt);
+        }
         
         // Parse response
         console.log('Content script: Parsing AI response...');
@@ -273,16 +292,20 @@ async function performAIGrouping(prompt) {
             console.log('Content script: Parsed JSON:', parsed);
             
             // Μετατροπή σε σωστό format για το background script
-            const result = {
-                keywords: parsed.keywords || []
-            };
+            // Support optional shopping flag per item if provided by the model
+            const items = Array.isArray(parsed.keywords) ? parsed.keywords : [];
+            const normalized = items.map(it => ({
+                index: it.index,
+                keywords: Array.isArray(it.keywords) ? it.keywords : [],
+                shopping: it.shopping === true
+            }));
+            const result = { keywords: normalized };
             
             console.log('Content script: Converted to background format:', result);
             return result;
         } else {
-            console.error('Content script: No valid JSON found in AI response');
-            console.error('Content script: Full response:', response);
-            throw new Error('No valid JSON found in AI response');
+            console.warn('🤖 [AI] No valid JSON found in AI response, using heuristic keywords');
+            return buildHeuristicKeywordsFromPrompt(prompt);
         }
         
     } catch (error) {
@@ -292,7 +315,40 @@ async function performAIGrouping(prompt) {
             message: error.message,
             stack: error.stack
         });
-        throw error;
+        // Final fallback to heuristic keywords
+        return buildHeuristicKeywordsFromPrompt(prompt);
+    }
+}
+
+// Heuristic fallback: extract simple keywords from the prompt's tab list
+function buildHeuristicKeywordsFromPrompt(prompt) {
+    try {
+        const result = { keywords: [] };
+        const lines = String(prompt).split('\n');
+        const startIdx = lines.findIndex(l => l.trim() === 'Tabs:');
+        const stopwords = new Set(['the','and','for','with','from','your','site','home','official','news','blog','about','page','week','google','openai','ai','www','com','net','org','https','http','document','recently','published']);
+        if (startIdx >= 0) {
+            for (let i = startIdx + 1; i < lines.length; i++) {
+                const line = lines[i];
+                const m = line.match(/^(\d+)\s*:\s*"([^"]+)"\s*-\s*(\S+)/);
+                if (!m) continue;
+                const index = Number(m[1]);
+                const title = (m[2] || '').toLowerCase();
+                const url = (m[3] || '').toLowerCase();
+                const host = (() => { try { return new URL(url).hostname.replace(/^www\./,''); } catch { return ''; } })();
+                const raw = `${title} ${host}`;
+                const tokens = raw.split(/[^a-z0-9α-ωάέίήόύώ]+/i)
+                    .filter(t => t && t.length > 2 && !stopwords.has(t));
+                const picked = [];
+                for (const t of tokens) { if (!picked.includes(t)) picked.push(t); if (picked.length >= 4) break; }
+                result.keywords.push({ index, keywords: picked.slice(0, 3) });
+            }
+        }
+        console.log('🤖 [AI Keywords] Heuristic keywords built:', result.keywords.length);
+        return result;
+    } catch (e) {
+        console.warn('Heuristic keyword build failed:', e?.message || e);
+        return { keywords: [] };
     }
 }
 
@@ -389,6 +445,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     console.log('Content script: Received message:', message.type);
     
     switch (message.type) {
+        case 'AI_GROUPING_PREWARM':
+            ensureLanguageModelReady()
+                .then(ok => sendResponse({ success: !!ok }))
+                .catch(err => sendResponse({ success: false, error: err?.message || String(err) }));
+            return true;
         case 'PERFORM_AI_GROUPING':
         case 'AI_GROUPING_REQUEST':
             console.log('Content script: Received AI grouping request');
@@ -468,7 +529,8 @@ if (typeof window !== 'undefined') {
         extractStructuredData,
         extractLinkInfo,
         performAIGrouping,
-        performAISummarization
+        performAISummarization,
+        ensureLanguageModelReady
     };
     console.log('Content script: AITabCompanion setup complete:', Object.keys(window.AITabCompanion));
 }

@@ -1,14 +1,14 @@
 {
   "name": "S2_gaming_shop_trap",
   "tabs": [
-    {"url": "https://www.ea.com/games/ea-sports-fc/fc-24/ultimate-team/features", "gold": "gaming"},
+    {"url": "https://www.ea.com/en-gb/games/ea-sports-fc", "gold": "gaming"},
     {"url": "https://www.futbin.com/25/players", "gold": "gaming"},
     {"url": "https://www.fut.gg/squad-builder/", "gold": "gaming"},
-    {"url": "https://www.reddit.com/r/FIFA/", "gold": "gaming-community"},
+    {"url": "https://www.reddit.com/search/?q=fc+ultimate+team&cId=b4d5c9d2-2a4b-4054-9e79-6c8164408b7d&iId=a8c03b54-cccc-4f1b-b0d9-734eb02ee4e4", "gold": "gaming"},
     {"url": "https://www.amazon.com/s?k=gaming+chair", "gold": "shopping"},
-    {"url": "https://www.ebay.com/b/PC-Gaming-Accessories/175748/bn_7115495208", "gold": "shopping"},
-    {"url": "https://www.bestbuy.com/site/video-games/gaming-laptops/pcmcat287600050003.c?id=pcmcat287600050003", "gold": "shopping"},
-    {"url": "https://www.target.com/c/video-games-consoles/-/N-5xtg5", "gold": "shopping"}
+    {"url": "https://www.bestbuy.com/site/pc-gaming/gaming-laptops/pcmcat287600050003.c?id=pcmcat287600050003&intl=nosplash", "gold": "shopping"},
+    {"url": "https://www.ebay.com/sch/i.html?_nkw=pc+gaming+accessories&_sacat=0&_from=R40&_trksid=p2510209.m570.l1311", "gold": "shopping"},
+    {"url": "https://www.target.com/s?searchTerm=gaming&category=5xtg5&searchTermRaw=gaming", "gold": "shopping"}
   ],
   "notes": "Ultimate Team research must stay separate from commerce tabs that sell hardware/accessories."
 }

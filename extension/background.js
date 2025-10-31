@@ -112,8 +112,16 @@ if (typeof chrome !== 'undefined' && chrome.runtime) {
 
 if (typeof chrome !== 'undefined' && chrome.runtime) {
     if (chrome.runtime.onStartup && typeof chrome.runtime.onStartup.addListener === 'function') {
-        chrome.runtime.onStartup.addListener(() => {
+        chrome.runtime.onStartup.addListener(async () => {
             console.log('🔁 [Boot] Chrome runtime startup event; service worker active');
+            if (!AUTO_RELOAD_STALE_TABS || !STARTUP_SMART_RELOAD) return;
+            try {
+                const tabs = await chrome.tabs.query({});
+                const valid = tabs.filter(t => t && t.url && t.url.startsWith('http'));
+                await smartReloadTabs(valid);
+            } catch (e) {
+                console.warn('Startup smart reload failed:', e?.message || e);
+            }
         });
     }
     if (chrome.runtime.onSuspend && typeof chrome.runtime.onSuspend.addListener === 'function') {
@@ -127,13 +135,15 @@ if (typeof chrome !== 'undefined' && chrome.runtime) {
 let isScanning = false;
 let currentTabData = [];
 let aiGroups = [];
+// Last AI keyword dump for debugging/API
+let LAST_AI_KEYWORDS = [];
 let scanTimeout = null; // Για debounce
 let lastMergeDebugLog = null;
 let lastGoldenEvaluation = null;
 
 // Tunable constants για επιδόσεις και ακρίβεια
 const CONTENT_EXTRACTION_CONCURRENCY = 8;
-const TAB_EXTRACTION_TIMEOUT = 6000; // ms
+const TAB_EXTRACTION_TIMEOUT = 14000; // ms (increase for Docs/Sheets stability)
 const SIMILARITY_JOIN_THRESHOLD = 0.42;  // Reduced for better medical/AI grouping
 const SIMILARITY_SPLIT_THRESHOLD = 0.35;  // Reduced for better medical/AI grouping  
 const CROSS_GROUP_MERGE_THRESHOLD = 0.40; // Reduced for better medical/AI grouping
@@ -181,6 +191,15 @@ const SIMHASH_BITS = 32;
 const GROUP_AUTOSUSPEND_IDLE_MS = 5 * 60 * 1000;
 const GROUP_AUTOSUSPEND_CHECK_MS = 90 * 1000;
 
+// Smart reload for stale tabs (non-breaking default)
+const AUTO_RELOAD_STALE_TABS = true;               // Enable smart reload before scans
+const RELOAD_BYPASS_CACHE = false;                 // Keep cache to reduce bandwidth
+const RELOAD_TIMEOUT_MS = 15000;                   // Max wait per tab for reload
+const RELOAD_MAX_TABS = 16;                        // Safety cap to avoid mass reloads
+const STARTUP_SMART_RELOAD = true;                 // Also attempt smart reload on Chrome startup
+// Summarizer availability memory to avoid repeated failing attempts
+const SUMMARIZER_UNAVAILABLE_TTL_MS = 6 * 60 * 60 * 1000; // 6h
+
 const TAXONOMY_RULES = [
     { match: /youtube\.com|youtu\.be/i, tags: ['media', 'video', 'youtube'] },
     { match: /news|cnn|bbc|reuters|guardian/i, tags: ['news', 'media'] },
@@ -203,6 +222,26 @@ const AI_LABEL_TIMEOUT = 15000;
 const AI_SUMMARY_TIMEOUT = 16000;
 function nowMs() {
     return HAS_PERFORMANCE_API ? performance.now() : Date.now();
+}
+
+// ---- Generic detectors (content-based, domain-agnostic) ----
+function detectShoppingStrong(text = '', url = '') {
+    try {
+        const s = `${String(text || '')} ${String(url || '')}`.toLowerCase();
+        const hasCart = /(add to cart|add-to-cart|\bcart\b|checkout|buy now|buy)/.test(s);
+        const hasFulfillment = /(free shipping|delivery|\bin stock\b|returns?)/.test(s);
+        const hasCurrency = /[\$€£]\s?\d/.test(s) || /(usd|eur|gbp)\s?\d/.test(s);
+        const hasPriceWord = /\bprice\b|\bprices\b/.test(s);
+        const hasListingControls = /\bfilters?\b|\bsort\b|\brefine\b|\bapply filter\b/.test(s);
+        const hasGreekCommerce = /(καλάθι|ταμείο|αγορά|προσφορά|έκπτωση|εκπτωση|τιμή)/.test(s);
+        // Strong if: direct commerce actions OR fulfillment signals OR currency present
+        if (hasCart || hasFulfillment || hasCurrency || hasGreekCommerce) return true;
+        // Otherwise require combination of price and listing controls to avoid false positives
+        if (hasPriceWord && hasListingControls) return true;
+        return false;
+    } catch (_) {
+        return false;
+    }
 }
 
 function logTiming(label, startTime) {
@@ -519,11 +558,109 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 });
             return true;
             
+        case 'AI_GROUPING_RESPONSE':
+            // Silence noisy relay from content script; background already awaits tabs.sendMessage
+            console.log('🤖 [AI] Background received AI_GROUPING_RESPONSE (relay)');
+            sendResponse({ ok: true });
+            return true;
+
+        case 'GET_AI_KEYWORDS':
+            try {
+                sendResponse({ success: true, keywords: LAST_AI_KEYWORDS });
+            } catch (e) {
+                sendResponse({ success: false, error: e?.message || String(e) });
+            }
+            return true;
+
         default:
             console.warn('Unknown message type:', message.type);
             sendResponse({ success: false, error: 'Unknown message type' });
     }
 });
+
+/**
+ * Επιστρέφει true όταν το URL θεωρείται restricted
+ */
+function isRestrictedUrl(urlString) {
+    try {
+        const u = new URL(urlString);
+        const host = u.hostname || '';
+        return RESTRICTED_HOSTS.some(h => host.includes(h));
+    } catch (_) {
+        return true;
+    }
+}
+
+/**
+ * Περιμένει μέχρι το tab να δηλώσει status === 'complete' ή timeouts
+ */
+function waitForTabComplete(tabId, timeoutMs = RELOAD_TIMEOUT_MS) {
+    return new Promise((resolve) => {
+        let done = false;
+        const timer = setTimeout(() => {
+            if (done) return;
+            done = true;
+            try { chrome.tabs.onUpdated.removeListener(listener); } catch (_) {}
+            resolve(false);
+        }, timeoutMs);
+
+        const listener = (updatedTabId, changeInfo) => {
+            if (updatedTabId !== tabId) return;
+            if (changeInfo && changeInfo.status === 'complete') {
+                if (done) return;
+                done = true;
+                clearTimeout(timer);
+                try { chrome.tabs.onUpdated.removeListener(listener); } catch (_) {}
+                resolve(true);
+            }
+        };
+        chrome.tabs.onUpdated.addListener(listener);
+    });
+}
+
+/**
+ * Κάνει safe reload μόνο σε «πιθανώς προβληματικά» tabs πριν το scan
+ * - Reloads: discarded ή status !== 'complete'
+ * - Skip: active, pinned, audible, restricted hosts
+ * - Περιμένει μέχρι να φορτώσουν (ή timeout) πριν συνεχίσει
+ */
+async function smartReloadTabs(tabs) {
+    if (!AUTO_RELOAD_STALE_TABS) return { reloaded: 0 };
+    const candidates = [];
+    for (const tab of tabs) {
+        try {
+            if (!tab || !tab.id || !tab.url) continue;
+            if (!tab.url.startsWith('http')) continue;
+            if (isRestrictedUrl(tab.url)) continue;
+            const status = tab.status; // 'loading' | 'complete' | undefined
+            const needsReload = (tab.discarded === true) || (status && status !== 'complete');
+            const safeToReload = !tab.active && !tab.pinned && !tab.audible;
+            if (needsReload && safeToReload) candidates.push(tab);
+        } catch (_) {}
+    }
+    if (!candidates.length) return { reloaded: 0 };
+
+    const limited = candidates.slice(0, RELOAD_MAX_TABS);
+    console.log(`🔄 [Smart Reload] Preparing to reload ${limited.length}/${candidates.length} stale tabs...`);
+
+    let reloaded = 0;
+    await Promise.all(limited.map(async (tab) => {
+        try {
+            await chrome.tabs.reload(tab.id, { bypassCache: RELOAD_BYPASS_CACHE });
+            const ok = await waitForTabComplete(tab.id).catch(() => false);
+            if (!ok) {
+                console.warn(`🔄 [Smart Reload] Tab ${tab.id} did not complete within timeout`);
+            } else {
+                reloaded += 1;
+            }
+        } catch (e) {
+            console.warn(`🔄 [Smart Reload] Reload failed for tab ${tab.id}:`, e?.message || e);
+        }
+    }));
+
+    console.log(`🔄 [Smart Reload] Completed. Reloaded ${reloaded} tabs (cap ${RELOAD_MAX_TABS}).`);
+    return { reloaded };
+}
 
 /**
  * Εξασφαλίζει ότι το extension έχει τα απαραίτητα host permissions για τα tabs που θα αναλυθούν
@@ -700,6 +837,17 @@ async function handleScanTabs(sendResponse) {
             return;
         }
         console.log('Host permissions verified successfully');
+
+        // Smart reload για tabs που είναι discarded/μη ολοκληρωμένα
+        try {
+            const reloadStart = nowMs();
+            const { reloaded } = await smartReloadTabs(validTabs);
+            if (reloaded > 0) {
+                logTiming(`Smart reload (${reloaded} tabs)`, reloadStart);
+            }
+        } catch (e) {
+            console.warn('Smart reload step failed:', e?.message || e);
+        }
         
         // Αποθήκευση βασικών πληροφοριών tabs
         const basicTabData = validTabs.map(tab => ({
@@ -1272,49 +1420,33 @@ async function performSelectiveSummarization(needsSummarizer) {
  * Fast taxonomy extraction για triage
  */
 function extractFastTaxonomy(tab) {
-    const domain = tab.domain || '';
     const title = (tab.title || '').toLowerCase();
-    const url = tab.url || '';
-    
-    // Domain-based taxonomy - αφαιρέθηκαν S2 domains
-    let domainCategory = 'general';
-    if (domain.includes('pubmed') || domain.includes('nejm') || domain.includes('who.int')) {
-        domainCategory = 'medical';
-    } else if (domain.includes('techcrunch') || domain.includes('openai') || domain.includes('google')) {
-        domainCategory = 'technology';
-    } else if (domain.includes('steam') || domain.includes('epic') || domain.includes('playstation')) {
-        domainCategory = 'gaming';
-    } else if (domain.includes('shop') && !domain.includes('amazon') && !domain.includes('ebay') && 
-               !domain.includes('bestbuy') && !domain.includes('target')) {
-        domainCategory = 'shopping';
-    } else if (domain.includes('youtube') || domain.includes('netflix')) {
-        domainCategory = 'entertainment';
-    }
-    
-    // Title-based taxonomy - αφαιρέθηκαν S2 keywords
-    let titleCategory = 'general';
-    if (title.includes('medical') || title.includes('health') || title.includes('research')) {
-        titleCategory = 'medical';
-    } else if (title.includes('ai') || title.includes('artificial') || title.includes('tech')) {
-        titleCategory = 'technology';
-    } else if (title.includes('game') || title.includes('gaming')) {
-        // Αφαιρέθηκαν: fifa, fc, ultimate, team, squad, players, fut
-        titleCategory = 'gaming';
-    } else if (title.includes('buy') || title.includes('shop') || title.includes('price')) {
-        // Αφαιρέθηκαν: chair, laptop, accessories, sale, deals
-        titleCategory = 'shopping';
-    }
-    
-    // Confidence based on agreement
-    const confidence = domainCategory === titleCategory ? 0.8 : 0.5;
-    const finalCategory = confidence > 0.6 ? domainCategory : 'general';
-    
-    // Debug logging για να δούμε τι συμβαίνει
-    console.log(`🔍 [Taxonomy] Tab: "${title}" | Domain: ${domainCategory} | Title: ${titleCategory} | Final: ${finalCategory} | Confidence: ${confidence}`);
-    
+    const meta = (tab.metaDescription || '').toLowerCase();
+    const path = (() => { try { return (new URL(tab.url || '')).pathname.toLowerCase(); } catch { return ''; } })();
+    const text = `${title} ${meta} ${path}`;
+
+    // Pure content-based taxonomy
+    const isMedical = /(\bmedical\b|\bhealth\b|\bmedicine\b|\bclinical\b|\btreatment\b|\bpatient\b|\bjournal\b|\bresearch\b)/.test(text);
+    const isTech = /(\bai\b|artificial intelligence|\btech\b|\bsoftware\b|\bdeveloper\b|\bapi\b|\bplatform\b|\bdocumentation\b|\bworkspace\b|\bcloud\b)/.test(text);
+    const isShopping = detectShoppingStrong(text, tab.url || '');
+    const isGaming = /(\bgaming\b|\bgame\b|\bgames\b|\bplayer\b|\bplayers\b|\bsquad\b|\brates?ings\b|\besports\b|\bsteam\b|\bxbox\b|\bps[45]\b)/.test(text);
+    const isNews = /(\bnews\b|\bblog\b|\barticle\b|\bupdate\b|\bpress\b|\blatest\b|\bbreaking\b)/.test(text);
+
+    let contentCategory = 'general';
+    if (isMedical) contentCategory = 'medical';
+    else if (isShopping) contentCategory = 'shopping'; // Prefer shopping over gaming if both present (strong only)
+    else if (isGaming) contentCategory = 'gaming';
+    else if (isTech) contentCategory = 'technology';
+    else if (isNews) contentCategory = 'news';
+
+    const confidence = contentCategory === 'general' ? 0.4 : 0.75;
+    const finalCategory = contentCategory;
+
+    console.log(`🔍 [Taxonomy] Tab: "${title}" | Content: ${contentCategory} | Final: ${finalCategory} | Confidence: ${confidence}`);
+
     return {
-        domain: domainCategory,
-        title: titleCategory,
+        domain: 'general',
+        title: contentCategory,
         final: finalCategory,
         confidence,
         keywords: extractKeywords(tab)
@@ -1361,18 +1493,10 @@ function calculateTriageConfidence(tab, taxonomy, tokens) {
  * Καθορίζει αν ένα tab χρειάζεται summarizer
  */
 function needsSummarizer(tab, taxonomy, tokens, confidence) {
-    // Gaming-related tabs need summarizer for better grouping
-    const isGamingRelated = tab.title.toLowerCase().includes('gaming') || 
-                           tab.title.toLowerCase().includes('fifa') || 
-                           tab.title.toLowerCase().includes('ultimate') ||
-                           tab.domain.includes('ea.com') ||
-                           tab.domain.includes('futbin') ||
-                           tab.domain.includes('reddit') ||
-                           tab.domain.includes('amazon') ||
-                           tab.domain.includes('bestbuy') ||
-                           tab.domain.includes('target');
-    
-    if (isGamingRelated) return true;
+    // Content-based triggers only (no domain checks)
+    const title = (tab.title || '').toLowerCase();
+    const isGamingRelated = /(\bgaming\b|\bfifa\b|\bultimate\b|\bplayers?\b|\bsquad\b)/.test(title);
+    if (isGamingRelated) return true; // richer context helps reduce leakage
     
     // High confidence tabs don't need summarizer
     if (confidence > 0.8) return false;
@@ -1402,9 +1526,7 @@ function calculateSummarizerPriority(tab, taxonomy, tokens) {
     if (tokens.unique > 15) priority += 5;
     if (tab.contentLength > 1000) priority += 5;
     
-    // Higher priority for important domains
-    if (tab.domain.includes('pubmed') || tab.domain.includes('nejm')) priority += 8;
-    if (tab.domain.includes('techcrunch') || tab.domain.includes('openai')) priority += 6;
+    // No domain-based priority; rely on content signals only
     
     return priority;
 }
@@ -1489,27 +1611,33 @@ function shouldMergeProvisional(taxonomy1, tokens1, taxonomy2, tokens2) {
         return true;
     }
     
-    // Gaming-specific merge logic - αφαιρέθηκαν S2 keywords
-    if ((taxonomy1.final === 'gaming' || taxonomy2.final === 'gaming') && 
-        (taxonomy1.final === 'general' || taxonomy2.final === 'general')) {
-        const gamingTokens = ['gaming', 'game']; // Αφαιρέθηκαν: fc, fifa, ultimate, team, players, squad
-        const hasGamingTokens = gamingTokens.some(token => 
-            tokens1.tokens.includes(token) || tokens2.tokens.includes(token)
-        );
-        if (hasGamingTokens) {
-            console.log(`🔗 [Merge] Gaming-specific merge detected`);
+    // Gaming-specific merge logic (conservative):
+    // - One tab is gaming and the other is general
+    // - BOTH sides must carry gaming tokens to avoid pulling unrelated general tabs
+    // - If either side has shopping tokens, do NOT merge under gaming
+    if ((taxonomy1.final === 'gaming' && taxonomy2.final === 'general') || (taxonomy2.final === 'gaming' && taxonomy1.final === 'general')) {
+        const gamingTokens = new Set(['gaming', 'game', 'players', 'squad']);
+        const shoppingTokens = new Set(['buy','shop','price','sale','deal','cart','checkout']);
+        const t1 = new Set(tokens1.tokens);
+        const t2 = new Set(tokens2.tokens);
+        const t1HasGaming = Array.from(gamingTokens).some(k => t1.has(k));
+        const t2HasGaming = Array.from(gamingTokens).some(k => t2.has(k));
+        const t1IsShopping = Array.from(shoppingTokens).some(k => t1.has(k));
+        const t2IsShopping = Array.from(shoppingTokens).some(k => t2.has(k));
+        if (t1HasGaming && t2HasGaming && !(t1IsShopping || t2IsShopping)) {
+            console.log(`🔗 [Merge] Gaming-specific merge detected (both sides)`);
             return true;
         }
     }
     
-    // Shopping-specific merge logic - αφαιρέθηκαν S2 keywords
-    if ((taxonomy1.final === 'shopping' || taxonomy2.final === 'shopping') && 
-        (taxonomy1.final === 'general' || taxonomy2.final === 'general')) {
-        const shoppingTokens = ['buy', 'shop', 'price']; // Αφαιρέθηκαν: chair, laptop, accessories, sale, deals
-        const hasShoppingTokens = shoppingTokens.some(token => 
-            tokens1.tokens.includes(token) || tokens2.tokens.includes(token)
-        );
-        if (hasShoppingTokens) {
+    // Shopping-specific merge logic (conservative):
+    // - One tab is shopping and the other is general
+    // - The general tab must contain shopping tokens
+    if ((taxonomy1.final === 'shopping' && taxonomy2.final === 'general') || (taxonomy2.final === 'shopping' && taxonomy1.final === 'general')) {
+        const shoppingTokens = new Set(['buy','shop','price','sale','deal','cart','checkout']);
+        const generalTokens = taxonomy1.final === 'general' ? new Set(tokens1.tokens) : new Set(tokens2.tokens);
+        const hasShop = Array.from(shoppingTokens).some(k => generalTokens.has(k));
+        if (hasShop) {
             console.log(`🔗 [Merge] Shopping-specific merge detected`);
             return true;
         }
@@ -1887,26 +2015,44 @@ async function performAIEnsembleFusion(deterministicGroups, tabDataForAI) {
     // Clear cache for debugging
     await clearAllCache();
     
-    const FUSION_WEIGHTS = { det: 0.65, ai: 0.25, tax: 0.10 }; // Σφιχτά βάρη
+    // Πιο συντηρητικά βάρη: δίνουμε προτεραιότητα στο deterministic
+    const FUSION_WEIGHTS = { det: 0.80, ai: 0.15, tax: 0.05 };
     
     // Adaptive thresholds per category
     const ADAPTIVE_THRESHOLDS = {
         medical: 0.18,    // Lower for medical (strong domain similarities)
         technology: 0.20, // Lower for AI/tech content
         gaming: 0.25,     // Medium for gaming
-        shopping: 0.28,   // Higher for shopping (avoid over-merge)
         news: 0.30,       // Higher for news (avoid over-merge)
         general: 0.25     // Default
     };
     
     const FUSION_CENTROID_THRESHOLD = 0.35;
     const SHARD_SIZE = 12; // Max 12 tabs per shard
-    const SHARD_TIMEOUT = 12000; // 12s per shard
-    const OVERALL_BUDGET = 15000; // 15s total budget
+    const SHARD_TIMEOUT = 20000; // 20s per shard (more stable on first run)
+    const OVERALL_BUDGET = 30000; // 30s total budget to allow model warmup
     const MAX_CONCURRENT_SHARDS = 2; // Max 2 concurrent shards
     
     const startTime = Date.now();
-    const aiSuggestions = new Map(); // tabIndex -> { groupId, confidence }
+    const aiSuggestions = new Map(); // tabIndex -> { keywords, confidence }
+
+    // Strict filtering to avoid noisy AI keywords
+    const AI_KEYWORD_STOPWORDS = new Set([
+        'none','update','updates','official','website','home','page','site','general','info',
+        'news','blog','article','the','and','for','with','from','about','choose','000'
+    ]);
+    function sanitizeKeywords(list) {
+        const out = [];
+        for (const raw of (list || [])) {
+            const t = String(raw || '').toLowerCase().trim();
+            if (!t) continue;
+            if (t.length < 3) continue;
+            if (/^\d+$/.test(t)) continue;
+            if (AI_KEYWORD_STOPWORDS.has(t)) continue;
+            if (!out.includes(t)) out.push(t);
+        }
+        return out.slice(0, 5);
+    }
     
     // 1. Create shards from deterministic groups
     const shards = createShardsFromGroups(deterministicGroups, tabDataForAI, SHARD_SIZE);
@@ -1932,12 +2078,20 @@ async function performAIEnsembleFusion(deterministicGroups, tabDataForAI) {
                 aiResult.keywords.forEach((kwSet, index) => {
                     // Map local shard index to global tab index
                     const globalIndex = shard.tabIndices[kwSet.index];
-                    console.log(`🤖 [Stage 5] Tab ${kwSet.index} (global: ${globalIndex}): [${kwSet.keywords?.join(', ') || 'none'}]`);
-                    if (kwSet.keywords && kwSet.keywords.length > 0 && typeof globalIndex === 'number') {
+                    const cleaned = sanitizeKeywords(kwSet.keywords);
+                    console.log(`🤖 [Stage 5] Tab ${kwSet.index} (global: ${globalIndex}): [${cleaned.join(', ') || 'none'}]`);
+                    if (cleaned.length >= 2 && typeof globalIndex === 'number') {
+                        const tab = tabDataForAI[globalIndex];
+                        const url = (tab?.url || '').toLowerCase();
+                        const title = (tab?.title || '').toLowerCase();
+                        const isShopping = kwSet.shopping === true || detectShoppingStrong(`${title} ${cleaned.join(' ')}`, url);
                         aiSuggestions.set(globalIndex, {
-                            keywords: kwSet.keywords,
-                            confidence: 0.8 // High confidence for AI-generated keywords
+                            keywords: cleaned.slice(0, 3),
+                            confidence: cleaned.length >= 3 ? 0.75 : 0.6,
+                            isShopping
                         });
+                    } else {
+                        console.log(`🤖 [Stage 5] Ignoring weak AI keywords for tab ${kwSet.index}`);
                     }
                 });
             } else {
@@ -1950,6 +2104,19 @@ async function performAIEnsembleFusion(deterministicGroups, tabDataForAI) {
     }
     
     console.log(`🤖 [Stage 5] AI suggestions collected: ${aiSuggestions.size} tabs`);
+    // Populate LAST_AI_KEYWORDS for debug/API access
+    try {
+        LAST_AI_KEYWORDS = Array.from(aiSuggestions.entries()).map(([index, info]) => ({
+            index,
+            title: tabDataForAI[index]?.title || '',
+            url: tabDataForAI[index]?.url || '',
+            keywords: Array.isArray(info.keywords) ? info.keywords : [],
+            shopping: Boolean(info.isShopping)
+        }));
+    } catch (e) {
+        console.warn('Failed to populate LAST_AI_KEYWORDS:', e?.message || e);
+        LAST_AI_KEYWORDS = [];
+    }
     
     // Λεπτομερές logging για τα AI suggestions
     if (aiSuggestions.size > 0) {
@@ -1993,18 +2160,22 @@ async function performAIEnsembleFusion(deterministicGroups, tabDataForAI) {
 function createShardsFromGroups(groups, tabDataForAI, maxSize) {
     const shards = [];
     
-    // Create mixed shard with all unique tab indices
+    // Create mixed list with all unique tab indices
     const allTabIndices = [...new Set(groups.flatMap(g => g.tabIndices))];
     
     if (allTabIndices.length > 0) {
-        // Create one mixed shard with all tabs for comprehensive AI analysis
-        shards.push({
-            tabIndices: allTabIndices,
-            groupId: 'mixed_all_tabs',
-            type: 'mixed',
-            primaryTopic: 'mixed',
-            keywords: []
-        });
+        // Split into chunks to keep prompts smaller and faster
+        const size = Math.max(4, Math.min(maxSize || 12, 20));
+        for (let i = 0; i < allTabIndices.length; i += size) {
+            const slice = allTabIndices.slice(i, i + size);
+            shards.push({
+                tabIndices: slice,
+                groupId: `mixed_${i / size + 1}`,
+                type: 'mixed',
+                primaryTopic: 'mixed',
+                keywords: []
+            });
+        }
     }
     
     console.log(`🤖 [Shards] Created ${shards.length} shard(s):`, shards.map(s => ({
@@ -2019,7 +2190,7 @@ function createShardsFromGroups(groups, tabDataForAI, maxSize) {
 /**
  * Επεξεργάζεται ένα shard με AI
  */
-async function processShardWithAI(shard, tabDataForAI, timeout, retries = 2) {
+async function processShardWithAI(shard, tabDataForAI, timeout, retries = 0) {
     console.log(`🤖 [Stage 5] Processing shard with ${shard.tabIndices.length} tab indices`);
     const shardTabs = shard.tabIndices.map(index => tabDataForAI[index]).filter(Boolean);
     console.log(`🤖 [Stage 5] Shard tabs after filtering: ${shardTabs.length}`);
@@ -2087,7 +2258,8 @@ function createShardPrompt(shardTabs) {
     }).join('\n');
     
     return `Analyze these tabs and generate 3-5 keywords per tab describing their main topic/purpose.
-Return ONLY valid JSON in this format: {"keywords":[{"index":0,"keywords":["keyword1","keyword2"]}]}
+Additionally, for each tab, set a boolean field shopping=true if the tab is primarily about purchasing products (e-commerce, stores, carts, prices, shopping listings), else shopping=false.
+Return ONLY valid JSON in this format: {"keywords":[{"index":0,"keywords":["keyword1","keyword2"],"shopping":false}]}
 
 Tabs:
 ${tabsInfo}
@@ -2106,157 +2278,83 @@ async function executeAIGroupingWithTimeout(prompt, timeout) {
     console.log('🤖🤖🤖 [AI CLUSTERING START] 🤖🤖🤖');
     console.log('🤖 [AI] Executing AI grouping with timeout:', timeout, 'ms');
     console.log('🤖 [AI] Prompt length:', prompt.length, 'characters');
-    
-    try {
-        // Use the existing AI grouping function from content script
-        const result = await withTimeout((async () => {
-            // Execute AI grouping in content script context
-            const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-            if (!tab) throw new Error('No active tab found');
-            
-        // Use direct execution in page context
-        console.log('🤖 [AI] Using executeScript on tab:', tab.id, tab.url);
-        
-        // Find a usable tab (not chrome://, etc.)
-        const usableTab = tab.url.startsWith('http') ? tab : 
-            await chrome.tabs.query({ url: ['http://*/*', 'https://*/*'] }).then(tabs => tabs[0]);
-        
-        if (!usableTab) {
-            throw new Error('No usable tab found for AI execution');
-        }
-        
-        console.log('🤖 [AI] Using executeScript on tab:', usableTab.id, usableTab.url);
-        
-        console.log('🤖 [AI] Attempting to execute AI grouping...');
-        
-        // Content script is already loaded automatically via manifest
-        
-        const results = await chrome.scripting.executeScript({
-            target: { tabId: usableTab.id },
-            world: 'ISOLATED',
-            func: async (prompt) => {
-                console.log('🤖 [AI] Inside executeScript function, prompt length:', prompt.length);
-                console.log('🤖 [AI] window.AITabCompanion exists:', typeof window.AITabCompanion !== 'undefined');
-                
-                // Wait a bit for AITabCompanion to load
-                let attempts = 0;
-                while (typeof window.AITabCompanion === 'undefined' && attempts < 10) {
-                    console.log('🤖 [AI] Waiting for AITabCompanion, attempt', attempts);
-                    await new Promise(resolve => setTimeout(resolve, 100));
-                    attempts++;
-                }
-                
-                if (typeof window.AITabCompanion !== 'undefined') {
-                    console.log('🤖 [AI] AITabCompanion found!');
-                    console.log('🤖 [AI] AITabCompanion object:', window.AITabCompanion);
-                    console.log('🤖 [AI] performAIGrouping available:', typeof window.AITabCompanion.performAIGrouping);
-                    console.log('🤖 [AI] AITabCompanion methods:', Object.keys(window.AITabCompanion));
-                    
-                    if (window.AITabCompanion.performAIGrouping) {
-                        console.log('🤖 [AI] Executing performAIGrouping...');
-                        console.log('🤖 [AI] Prompt being sent to AI:', prompt.substring(0, 200) + '...');
-                        try {
-                            const result = await window.AITabCompanion.performAIGrouping(prompt);
-                            console.log('🤖 [AI] performAIGrouping completed, result type:', typeof result);
-                            console.log('🤖 [AI] performAIGrouping result:', result);
-                            console.log('🤖 [AI] performAIGrouping result length:', result?.length || 'no length');
-                            return result;
-                        } catch (aiError) {
-                            console.error('🤖 [AI] performAIGrouping failed:', aiError);
-                            console.error('🤖 [AI] Error details:', {
-                                name: aiError.name,
-                                message: aiError.message,
-                                stack: aiError.stack
-                            });
-                            return { groups: [], confidence: 0.5 };
-                        }
-                    } else {
-                        console.error('🤖 [AI] performAIGrouping function not found');
-                        throw new Error('performAIGrouping function not found');
-                    }
-                } else {
-                    console.error('🤖 [AI] AITabCompanion still not available after waiting');
-                    console.error('🤖 [AI] window keys:', Object.keys(window).slice(0, 20));
-                    throw new Error('AITabCompanion not available after waiting');
-                }
-            },
-            args: [prompt]
-        });
-        
-        console.log('🤖 [AI] executeScript returned:', results);
-        console.log('🤖 [AI] executeScript results length:', results?.length || 0);
-        console.log('🤖 [AI] First result:', results[0]);
-        console.log('🤖 [AI] First result documentId:', results[0]?.documentId);
-        console.log('🤖 [AI] First result frameId:', results[0]?.frameId);
-        
-        const aiResult = results[0]?.result;
-            
-            console.log('🤖 [AI] Raw AI result:', aiResult);
-            console.log('🤖 [AI] Raw AI result type:', typeof aiResult);
-            console.log('🤖 [AI] Raw AI result length:', aiResult?.length || 'no length');
-            
-            // Log raw JSON response if available
-            if (aiResult && typeof aiResult === 'object' && aiResult.groups) {
-                console.log('🤖 [AI Raw JSON] Full AI response object:', JSON.stringify(aiResult, null, 2));
-            }
-            
-            // Λεπτομερές debugging για την απάντηση του AI
-            if (aiResult && typeof aiResult === 'object') {
-                console.log('🤖 [AI] AI result has groups:', aiResult.groups?.length || 0);
-                console.log('🤖 [AI] AI result confidence:', aiResult.confidence);
-                if (aiResult.groups && aiResult.groups.length === 0) {
-                    console.log('🤖 [AI] ⚠️ AI returned empty groups array - this might indicate the AI could not find similar tabs to group');
-                }
-            }
-            
-            // Parse AI result if it's a string
-            if (typeof aiResult === 'string') {
-                try {
-                    const parsed = JSON.parse(aiResult);
-                    console.log('🤖 [AI] Parsed AI result:', parsed);
-                    return parsed;
-            } catch (error) {
-                    console.warn('🤖 [AI] Failed to parse AI result as JSON:', error);
-                    return { groups: [], confidence: 0.5 };
-                }
-            }
-            
-            // If it's a function, return empty result
-            if (typeof aiResult === 'function') {
-                console.warn('🤖 [AI] AI result is a function, returning empty result');
-                return { groups: [], confidence: 0.5 };
-            }
-            
-            return aiResult || { groups: [], confidence: 0.5 };
-        })(), timeout, 'AI grouping timeout');
-        
-        console.log('🤖 [AI] AI grouping result:', result);
-        
-        // Λεπτομερές logging για τα keywords που επέστρεψε το AI
-        if (result && result.keywords && Array.isArray(result.keywords)) {
-            console.log('🤖 [AI Keywords] AI returned', result.keywords.length, 'keyword sets');
-            if (result.keywords.length === 0) {
-                console.log('🤖 [AI Keywords] ⚠️ AI returned 0 keyword sets - this might indicate an issue with the AI response');
-                console.log('🤖 [AI Keywords] Full AI result object:', JSON.stringify(result, null, 2));
-            }
-            result.keywords.forEach((kwSet, index) => {
-                console.log(`🤖 [AI Keywords ${index}] Tab ${kwSet.index}: [${kwSet.keywords?.join(', ') || 'none'}]`);
+
+    // Find a usable tab (http/https)
+    let [active] = await chrome.tabs.query({ active: true, currentWindow: true });
+    let usableTab = active && active.url && active.url.startsWith('http') ? active : null;
+    if (!usableTab) {
+        const httpTabs = await chrome.tabs.query({ url: ['http://*/*', 'https://*/*'] });
+        usableTab = httpTabs && httpTabs[0];
+    }
+    if (!usableTab) {
+        console.warn('🤖 [AI] No usable tab found for messaging');
+        return { keywords: [], confidence: 0.1 };
+    }
+    console.log('🤖 [AI] Messaging content script on tab:', usableTab.id, usableTab.url);
+
+    const send = (type, data) => new Promise((resolve, reject) => {
+        try {
+            chrome.tabs.sendMessage(usableTab.id, { type, data, prompt }, (response) => {
+                const err = chrome.runtime.lastError;
+                if (err) return reject(new Error(err.message));
+                resolve(response);
             });
-        } else {
-            console.log('🤖 [AI Keywords] No valid keywords found in AI result');
-            console.log('🤖 [AI Keywords] Full result object:', JSON.stringify(result, null, 2));
+        } catch (e) {
+            reject(e);
         }
-        
+    });
+
+    // Try prewarm first
+    try {
+        const prewarm = await withTimeout(send('AI_GROUPING_PREWARM'), Math.min(5000, Math.max(2000, timeout - 2000)), 'LM prewarm timeout');
+        console.log('🤖 [AI] Prewarm result:', prewarm);
+        if (!prewarm || prewarm.success !== true) {
+            console.warn('🤖 [AI] Language model not ready, skipping AI grouping');
+            console.log('🤖🤖🤖 [AI CLUSTERING END] 🤖🤖🤖');
+            return { keywords: [], confidence: 0.1 };
+        }
+    } catch (e) {
+        console.warn('🤖 [AI] Prewarm failed or no receiver:', e?.message || e);
+        // Attempt to inject content script and retry once
+        try {
+            await chrome.scripting.executeScript({ target: { tabId: usableTab.id }, files: ['content.js'] });
+            await new Promise(r => setTimeout(r, 150));
+            const prewarm2 = await withTimeout(send('AI_GROUPING_PREWARM'), Math.min(5000, Math.max(2000, timeout - 2000)), 'LM prewarm timeout');
+            console.log('🤖 [AI] Prewarm retry:', prewarm2);
+            if (!prewarm2 || prewarm2.success !== true) {
+                console.warn('🤖 [AI] LM still not ready after injection');
+                console.log('🤖🤖🤖 [AI CLUSTERING END] 🤖🤖🤖');
+                return { keywords: [], confidence: 0.1 };
+            }
+        } catch (injErr) {
+            console.warn('🤖 [AI] Injection failed:', injErr?.message || injErr);
+            console.log('🤖🤖🤖 [AI CLUSTERING END] 🤖🤖🤖');
+            return { keywords: [], confidence: 0.1 };
+        }
+    }
+
+    try {
+        const resp = await withTimeout(send('AI_GROUPING_REQUEST', prompt), timeout, 'AI grouping timeout');
+        console.log('🤖 [AI] Message response:', resp);
+        if (resp && resp.success && resp.result) {
+            const result = resp.result;
+            if (Array.isArray(result.keywords)) {
+                console.log('🤖 [AI Keywords] Received', result.keywords.length, 'keyword sets');
+            }
+            console.log('🤖🤖🤖 [AI CLUSTERING END] 🤖🤖🤖');
+            return result;
+        }
+        if (resp && resp.keywords) {
+            console.log('🤖 [AI Keywords] Received (direct)', resp.keywords.length);
+            console.log('🤖🤖🤖 [AI CLUSTERING END] 🤖🤖🤖');
+            return resp;
+        }
+        console.warn('🤖 [AI] Invalid AI grouping response, returning empty keywords');
         console.log('🤖🤖🤖 [AI CLUSTERING END] 🤖🤖🤖');
-        return result || { groups: [], confidence: 0.5 };
-        
-    } catch (error) {
-        console.warn('🤖 [AI] AI grouping failed:', error.message);
-        console.warn('🤖 [AI] Error type:', error.name);
-        console.warn('🤖 [AI] Error stack:', error.stack?.substring(0, 200));
+        return { keywords: [] };
+    } catch (e) {
+        console.warn('🤖 [AI] Grouping request failed:', e?.message || e);
         console.log('🤖🤖🤖 [AI CLUSTERING END] 🤖🤖🤖');
-        
-        // Return empty result with low confidence when AI fails
         return { keywords: [], confidence: 0.1 };
     }
 }
@@ -2292,31 +2390,10 @@ async function performFusionScoring(deterministicGroups, aiSuggestions, tabDataF
             const categoryI = inferCategory(tabI);
             const categoryJ = inferCategory(tabJ);
             const category = (categoryI === categoryJ && categoryI !== 'general') ? categoryI : 'general';
-            
-            // Extra safety check: don't merge conflicting categories even with high score
-            const conflictingCategories = [
-                ['technology', 'gaming'],
-                ['technology', 'medical'],
-                ['gaming', 'medical'],
-                ['technology', 'shopping'],
-                ['gaming', 'shopping']
-            ];
-            
-            const isConflicting = conflictingCategories.some(([cat1, cat2]) => 
-                (categoryI === cat1 && categoryJ === cat2) || 
-                (categoryI === cat2 && categoryJ === cat1)
-            );
-            
             const adaptiveThreshold = adaptiveThresholds && adaptiveThresholds[category] ? adaptiveThresholds[category] : (adaptiveThresholds?.general || 0.25);
             
             if (fusionScore >= adaptiveThreshold) {
                 console.log(`🔗 [Fusion] High similarity detected: tabs ${i}-${j}, score: ${fusionScore.toFixed(3)} (threshold: ${adaptiveThreshold}) [category: ${category}]`);
-                
-                // Block merge for conflicting categories unless score is very high
-                if (isConflicting && fusionScore < 0.5) {
-                    console.log(`🚫 [Fusion] Blocked merge of conflicting categories: ${categoryI} vs ${categoryJ} (score: ${fusionScore.toFixed(3)})`);
-                    continue;
-                }
                 
                 // Merge tabs
                 const groupA = findGroupContaining(fusionGroups, i);
@@ -2364,46 +2441,37 @@ async function performFusionScoring(deterministicGroups, aiSuggestions, tabDataF
  */
 function inferCategory(tab) {
     if (!tab) return 'general';
-    
+
     const title = (tab.title || '').toLowerCase();
     const url = (tab.url || '').toLowerCase();
     const domain = (tab.domain || '').toLowerCase();
-    const allText = title + ' ' + url + ' ' + domain;
-    
-    // Medical/Health category
-    if (allText.includes('medical') || allText.includes('health') || allText.includes('pubmed') || 
-        allText.includes('nejm') || allText.includes('medicalnewstoday') || allText.includes('research') ||
-        allText.includes('clinical') || allText.includes('treatment') || allText.includes('patient')) {
-        return 'medical';
-    }
-    
-    // Technology/AI category
-    if (allText.includes('ai') || allText.includes('artificial intelligence') || allText.includes('tech') ||
-        allText.includes('openai') || allText.includes('techcrunch') || allText.includes('theverge') ||
-        allText.includes('google ai') || allText.includes('innovation') || allText.includes('software')) {
-        return 'technology';
-    }
-    
-    // Gaming category
-    if (allText.includes('gaming') || allText.includes('game') || allText.includes('fifa') ||
-        allText.includes('futbin') || allText.includes('ultimate team') || allText.includes('fc') ||
-        allText.includes('sports') || allText.includes('player') || allText.includes('squad')) {
-        return 'gaming';
-    }
-    
-    // Shopping category
-    if (allText.includes('amazon') || allText.includes('target') || allText.includes('best buy') ||
-        allText.includes('ebay') || allText.includes('shop') || allText.includes('purchase') ||
-        allText.includes('buy') || allText.includes('cart') || allText.includes('checkout')) {
+    const allText = `${title} ${url} ${domain}`;
+
+    // Shopping first: if shopping cues exist, prefer shopping over gaming
+    if (detectShoppingStrong(allText, url)) {
         return 'shopping';
     }
-    
+
+    // Medical/Health category (content-based, no domain-specific brands)
+    if (/(\bmedical\b|\bhealth\b|\bmedicine\b|\bclinical\b|\btreatment\b|\bpatient\b|\bjournal\b|\bresearch\b)/.test(allText)) {
+        return 'medical';
+    }
+
+    // Technology/AI category (content-based)
+    if (/(\bai\b|artificial intelligence|\btech\b|\bsoftware\b|\bdeveloper\b|\bapi\b|\bplatform\b|\bdocumentation\b|\bworkspace\b|\bcloud\b)/.test(allText)) {
+        return 'technology';
+    }
+
+    // Gaming category (content-based)
+    if (/(\bgaming\b|\bgame\b|\bgames\b|\bplayer\b|\bplayers\b|\bsquad\b|\brates?ings\b|\besports\b|\bsteam\b|\bxbox\b|\bps[45]\b)/.test(allText)) {
+        return 'gaming';
+    }
+
     // News category
-    if (allText.includes('news') || allText.includes('blog') || allText.includes('article') ||
-        allText.includes('update') || allText.includes('press') || allText.includes('latest')) {
+    if (/(\bnews\b|\bblog\b|\barticle\b|\bupdate\b|\bpress\b|\blatest\b|\bbreaking\b)/.test(allText)) {
         return 'news';
     }
-    
+
     return 'general';
 }
 
@@ -2537,6 +2605,31 @@ function calculateFusionScore(i, j, aiSuggestions, tabDataForAI, weights) {
         }
     }
     
+    // Commerce vs content guardrails: avoid merging shopping with gameplay/wiki
+    const urlI = (tabI.url || '').toLowerCase();
+    const urlJ = (tabJ.url || '').toLowerCase();
+    const hostI = (tabI.domain || '').toLowerCase();
+    const hostJ = (tabJ.domain || '').toLowerCase();
+    const isShop = (u,h) => /amazon\.|ebay\.|bestbuy\.|target\.|shop|store|cart|checkout/.test(u + ' ' + h);
+    const isGameContent = (t,u,h) => /futbin|fut\.gg|ultimate team|squad|ratings|players|reddit/.test((t||'').toLowerCase() + ' ' + u + ' ' + h);
+    const shoppingI = isShop(urlI, hostI);
+    const shoppingJ = isShop(urlJ, hostJ);
+    const gameI = isGameContent(tabI.title, urlI, hostI);
+    const gameJ = isGameContent(tabJ.title, urlJ, hostJ);
+    // If one is shopping and the other is gameplay/wiki, apply a strong penalty to AI agreement
+    if ((shoppingI && gameJ) || (shoppingJ && gameI)) {
+        aiAgree *= 0.25;
+    }
+
+    // If both AI suggestions exist and disagree on shopping tag, disallow AI-driven merge
+    if (aiI && aiJ) {
+        const aiShopI = aiI.isShopping === true;
+        const aiShopJ = aiJ.isShopping === true;
+        if (aiShopI !== aiShopJ) {
+            aiAgree = 0;
+        }
+    }
+
     // Taxonomy agreement - USE AI KEYWORDS IF AVAILABLE
     let taxAgree = 0;
     
@@ -2576,6 +2669,14 @@ function calculateFusionScore(i, j, aiSuggestions, tabDataForAI, weights) {
         score = weights.det * detScore + weights.tax * taxAgree; // Remove AI weight
     }
     
+    // Hard gate: prevent shopping ↔ any non-shopping merges, and AI-tag disagreement on shopping
+    const catI = taxI;
+    const catJ = taxJ;
+    const shopConflict = ((shoppingI || (aiI && aiI.isShopping)) || (shoppingJ || (aiJ && aiJ.isShopping))) && (catI !== 'shopping' || catJ !== 'shopping');
+    if (shopConflict || (aiI && aiJ && (aiI.isShopping === true) !== (aiJ.isShopping === true))) {
+        score = 0; // force below any threshold
+    }
+    
     return Math.max(0, Math.min(1, score)); // Clamp to [0,1]
 }
 
@@ -2598,6 +2699,107 @@ function isBridgeTab(tab) {
     const bridgeKeywords = /search|results|find|explore|discover|browse/i;
     return bridgeKeywords.test(tab.title) || 
            bridgeKeywords.test(tab.topicHints || '');
+}
+
+/**
+ * Enforce purity rules on final groups (post-fusion), to avoid cross-topic mixing
+ */
+function splitMixedGroups(groups, tabData) {
+    // Generic detectors (no domain-specific checks)
+    const isShop = (u,h,t) => detectShoppingStrong(`${t||''} ${h||''}`, u||'');
+    const isProductivity = (u,h,t) => /(\bdocument\b|\bdocuments\b|\bsheet\b|\bspreadsheet\b|\bslides?\b|\bnote\b|\bnotes\b|\bcalendar\b|\btask\b|\bkanban\b)/.test(((u||'')+' '+(h||'')+' '+(t||'')).toLowerCase());
+
+    const result = [];
+    for (const group of groups) {
+        const indices = (group.tabIndices || []).slice();
+        if (indices.length < 3) { result.push(group); continue; }
+
+        const buckets = { gaming: [], shopping: [], technology: [], medical: [], productivity: [], other: [] };
+        for (const i of indices) {
+            const tab = tabData[i];
+            if (!tab) { buckets.other.push(i); continue; }
+            const cat = inferCategory(tab);
+            if (isShop(tab.url, tab.domain, tab.title)) { buckets.shopping.push(i); continue; }
+            if (cat === 'gaming') buckets.gaming.push(i);
+            else if (cat === 'technology') buckets.technology.push(i);
+            else if (cat === 'medical') buckets.medical.push(i);
+            else if (isProductivity(tab.url, tab.domain)) buckets.productivity.push(i);
+            else buckets.other.push(i);
+        }
+
+        const total = indices.length;
+        const used = new Set();
+        const hasGaming = buckets.gaming.length > 0;
+        const gamingMajority = buckets.gaming.length >= Math.ceil(total * 0.5);
+
+        // Rule 1: If gaming is majority, keep only gaming in this group
+        if (gamingMajority) {
+            // Gaming-only subgroup
+            if (buckets.gaming.length >= 2) {
+                result.push({
+                    ...group,
+                    tabIndices: buckets.gaming.slice(),
+                    primaryTopic: 'gaming'
+                });
+                buckets.gaming.forEach(i => used.add(i));
+            }
+            // Always exclude shopping from gaming, even singletons
+            if (buckets.shopping.length >= 1) {
+                result.push({
+                    ...group,
+                    tabIndices: buckets.shopping.slice(),
+                    primaryTopic: 'shopping'
+                });
+                buckets.shopping.forEach(i => used.add(i));
+            }
+            // Add other coherent categories (size >= 2)
+            for (const cat of ['technology','medical','productivity']) {
+                const arr = buckets[cat];
+                if (arr.length >= 2) {
+                    result.push({ ...group, tabIndices: arr.slice(), primaryTopic: cat });
+                    arr.forEach(i => used.add(i));
+                }
+            }
+            // Leftovers (keep only if they form a small subgroup)
+            const leftovers = indices.filter(i => !used.has(i));
+            if (leftovers.length >= 2) {
+                result.push({ ...group, tabIndices: leftovers });
+            }
+            continue;
+        }
+
+        // Rule 2: Always exclude shopping from any gaming mix (even singletons)
+        if (hasGaming && buckets.shopping.length >= 1) {
+            result.push({
+                ...group,
+                tabIndices: buckets.shopping.slice(),
+                primaryTopic: 'shopping'
+            });
+            buckets.shopping.forEach(i => used.add(i));
+        }
+
+        // Create coherent category subgroups (size >= 2)
+        let created = false;
+        for (const cat of ['gaming','technology','medical','productivity']) {
+            const arr = buckets[cat];
+            if (arr.length >= 2) {
+                result.push({ ...group, tabIndices: arr.slice(), primaryTopic: cat });
+                arr.forEach(i => used.add(i));
+                created = true;
+            }
+        }
+        const leftovers = indices.filter(i => !used.has(i));
+        if (leftovers.length >= 2) {
+            result.push({ ...group, tabIndices: leftovers });
+            created = true;
+        }
+
+        // If no splits were created, keep original group as-is
+        if (!created) {
+            result.push(group);
+        }
+    }
+    return result.length ? result : groups;
 }
 
 /**
@@ -2673,17 +2875,17 @@ function chunkArray(array, size) {
 }
 
 function extractTaxonomy(tab) {
-    const domain = tab.domain || '';
-    if (domain.includes('pubmed') || domain.includes('nejm')) return 'medical';
-    if (domain.includes('techcrunch') || domain.includes('openai')) return 'technology';
-    if (domain.includes('steam') || domain.includes('ea.com')) return 'gaming';
-    if (domain.includes('amazon') || domain.includes('bestbuy')) return 'shopping';
+    const text = `${tab.title || ''} ${tab.metaDescription || ''}`.toLowerCase();
+    if (/(\bmedical\b|\bhealth\b|\bmedicine\b|\bclinical\b|\bresearch\b)/.test(text)) return 'medical';
+    if (/(\bai\b|artificial intelligence|\btech\b|\bsoftware\b|\bdeveloper\b|\bapi\b)/.test(text)) return 'technology';
+    if (/(\bgaming\b|\bgame\b|\bplayers?\b|\bsquad\b)/.test(text)) return 'gaming';
+    if (/(\bshop\b|\bstore\b|\bbuy\b|\bprice\b|\bsale\b)/.test(text)) return 'shopping';
     return 'general';
 }
 
 function isGeneric(tab) {
-    const domain = tab.domain || '';
-    return /news|blog|topics|press/.test(domain);
+    const text = `${tab.title || ''} ${tab.metaDescription || ''}`.toLowerCase();
+    return /(\bnews\b|\bblog\b|\btopics\b|\bpress\b)/.test(text);
 }
 
 function isBridge(tab) {
@@ -2792,6 +2994,16 @@ async function performAIAnalysis() {
         // Use final groups from new pipeline
         let groups = finalGroups || [];
         console.log('🎯 [Smart Pipeline] Using final groups from new architecture');
+
+        // Enforce/split by category to reduce cross-topic mixing
+        try {
+            const before = groups.reduce((s,g)=>s+g.tabIndices.length,0);
+            groups = splitMixedGroups(groups, tabDataForAI);
+            const after = groups.reduce((s,g)=>s+g.tabIndices.length,0);
+            console.log(`🧹 [Purity] Adjusted group membership to reduce cross-topic mixing (tabs: ${before} → ${after})`);
+        } catch (purityErr) {
+            console.warn('Purity enforcement failed:', purityErr?.message || purityErr);
+        }
         
         // Create featureContext for compatibility with existing code
         const featureContext = prepareTabFeatureContext(tabDataForAI);
@@ -2983,7 +3195,28 @@ async function createTabGroups(aiGroups, tabData) {
             windowInfoCache.set(windowId, info);
             return info;
         };
-        
+        // Early cleanup of existing groups to avoid first-run double pass
+        const earlyCleanupStart = nowMs();
+        try {
+            const existingGroups = await chrome.tabGroups.query({});
+            for (const group of existingGroups) {
+                try {
+                    const tabsInGroup = await chrome.tabs.query({ groupId: group.id });
+                    const ids = tabsInGroup.map(t => t.id).filter(Boolean);
+                    if (ids.length) {
+                        await chrome.tabs.ungroup(ids);
+                        console.log(`Ungrouped ${ids.length} tabs from: ${group.title || 'Untitled'}`);
+                    }
+                } catch (groupCleanupErr) {
+                    console.log(`Group cleanup failed for ${group.id}:`, groupCleanupErr?.message || groupCleanupErr);
+                }
+            }
+        } catch (e) {
+            console.log('Early group cleanup skipped due to error:', e?.message || e);
+        }
+        logTiming('Existing group cleanup', earlyCleanupStart);
+        groupActivityState.clear();
+
         // Πρώτα ελέγχουμε όλα τα tabs που θα χρησιμοποιήσουμε
         console.log('Pre-checking all tabs for group creation...');
         const precheckStart = nowMs();
@@ -3013,26 +3246,17 @@ async function createTabGroups(aiGroups, tabData) {
                     console.log(`🔍 Window ${tabInfo.windowId}: type=${windowInfo.type}, state=${windowInfo.state}`);
 
                     if (windowInfo.type === 'normal') {
-                        if (['fullscreen', 'minimized', 'docked'].includes(windowInfo.state)) {
-                            try {
-                                await chrome.windows.update(tabInfo.windowId, { state: 'normal' });
-                                windowInfo = await getWindowInfo(tabInfo.windowId, { refresh: true });
-                                console.log(`  ↺ Adjusted window ${tabInfo.windowId} state to ${windowInfo.state}`);
-                            } catch (stateError) {
-                                console.log(`❌ Could not adjust window ${tabInfo.windowId} state:`, stateError.message);
-                            }
-                        }
-                        if (['normal', 'maximized'].includes(windowInfo.state)) {
+                        // Allow grouping in normal, maximized, fullscreen (no window state changes)
+                        if (['normal', 'maximized', 'fullscreen'].includes(windowInfo.state)) {
+                            validTabs.add(tabId);
                             if (!tabInfo.groupId || tabInfo.groupId === chrome.tabGroups.TAB_GROUP_ID_NONE) {
-                                validTabs.add(tabId);
                                 console.log(`✅ Tab ${tabId} is valid for grouping`);
                             } else {
-                                invalidTabs.add(tabId);
-                                console.log(`❌ Tab ${tabId} already in group ${tabInfo.groupId}`);
+                                console.log(`✅ Tab ${tabId} already in group ${tabInfo.groupId} (will be regrouped)`);
                             }
                         } else {
                             invalidTabs.add(tabId);
-                            console.log(`❌ Tab ${tabId} window remains in state ${windowInfo.state}`);
+                            console.log(`❌ Tab ${tabId} window state invalid for grouping: ${windowInfo.state}`);
                         }
                     } else {
                         invalidTabs.add(tabId);
@@ -3051,20 +3275,7 @@ async function createTabGroups(aiGroups, tabData) {
         console.log(`Pre-check complete: ${validTabs.size} valid tabs, ${invalidTabs.size} invalid tabs`);
         logTiming('Group creation pre-check', precheckStart);
         
-        // Διαγραφή υπαρχόντων groups
-        const cleanupStart = nowMs();
-        const existingGroups = await chrome.tabGroups.query({});
-        for (const group of existingGroups) {
-            try {
-                await chrome.tabGroups.update(group.id, { collapsed: false });
-                await chrome.tabGroups.remove(group.id);
-                console.log(`Removed existing group: ${group.title || 'Untitled'}`);
-            } catch (error) {
-                console.log(`Could not remove group ${group.id}:`, error.message);
-            }
-        }
-        logTiming('Existing group cleanup', cleanupStart);
-        groupActivityState.clear();
+        // Existing group cleanup already executed earlier in this function
         
         // Δημιουργία νέων groups
         console.log('🏗️ Creating groups from AI results...');
@@ -3102,30 +3313,17 @@ async function createTabGroups(aiGroups, tabData) {
                         if (finalValidTabIds.length > 0) {
                             console.log(`🔧 Attempting to create group "${group.name}" with tabs: [${finalValidTabIds.join(', ')}]`);
                             
-                            // Έλεγχος κάθε tab ξανά πριν τη δημιουργία
-                            const finalCheckTabs = [];            for (const tabId of finalValidTabIds) {
+                            // Έλεγχος κάθε tab ξανά πριν τη δημιουργία (χωρίς αλλαγή fullscreen)
+                            const finalCheckTabs = [];
+            for (const tabId of finalValidTabIds) {
                 try {
                     const tabInfo = await chrome.tabs.get(tabId);
-                    let windowInfo = await getWindowInfo(tabInfo.windowId);
+                    const windowInfo = await getWindowInfo(tabInfo.windowId);
                     console.log(`🔍 Final check tab ${tabId}: windowType=${windowInfo.type}, incognito=${tabInfo.incognito}, state=${windowInfo.state}`);
-                    
-                    if (windowInfo.type === 'normal' && !tabInfo.incognito) {
-                        if (['fullscreen', 'minimized', 'docked'].includes(windowInfo.state)) {
-                            try {
-                                await chrome.windows.update(tabInfo.windowId, { state: 'normal' });
-                                windowInfo = await getWindowInfo(tabInfo.windowId, { refresh: true });
-                                console.log(`  ↺ Adjusted window ${tabInfo.windowId} state to ${windowInfo.state}`);
-                            } catch (stateError) {
-                                console.log(`❌ Failed to adjust window state for tab ${tabId}:`, stateError.message);
-                            }
-                        }
-                        if (windowInfo.state === 'normal' || windowInfo.state === 'maximized') {
-                            finalCheckTabs.push(tabId);
-                        } else {
-                            console.log(`❌ Tab ${tabId} skipped after state adjustment: windowState=${windowInfo.state}`);
-                        }
+                    if (windowInfo.type === 'normal' && !tabInfo.incognito && ['normal','maximized','fullscreen'].includes(windowInfo.state)) {
+                        finalCheckTabs.push(tabId);
                     } else {
-                        console.log(`❌ Tab ${tabId} failed final check: windowType=${windowInfo.type}, incognito=${tabInfo.incognito}`);
+                        console.log(`❌ Tab ${tabId} failed final check: windowType=${windowInfo.type}, incognito=${tabInfo.incognito}, state=${windowInfo.state}`);
                     }
                 } catch (error) {
                     console.log(`❌ Tab ${tabId} failed final check:`, error.message);
@@ -3133,29 +3331,96 @@ async function createTabGroups(aiGroups, tabData) {
             }
                             
                             if (finalCheckTabs.length > 0) {
-                                // Απλή δημιουργία group με όλα τα valid tabs
-                                const groupId = await chrome.tabs.group({ tabIds: finalCheckTabs });
-                                
-                                // Ονομασία group
-                                await chrome.tabGroups.update(groupId, {
-                                    title: group.name,
-                                    color: getGroupColor(group.name)
-                                });
-                                
-                                console.log(`✅ Group "${group.name}" created successfully with ID: ${groupId} (${finalCheckTabs.length} tabs)`);
-                                
-                                // Log τα tabs που προστέθηκαν στο group
-                                finalCheckTabs.forEach(tabId => {
-                                    const tab = tabData.find(t => t.id === tabId);
-                                    console.log(`  📄 Tab ${tabId}: "${tab?.title || 'Unknown'}" (${tab?.domain || 'Unknown domain'})`);
-                                });
-                                
-                                group.chromeGroupId = groupId;
-                                group.autoSuspended = false;
-                                // Set lastActive to past so it can be suspended if user doesn't visit it
-                                group.lastActive = 0; // Never visited
-                                const initialState = { lastActive: 0, suspended: false };
-                                groupActivityState.set(groupId, initialState);
+                                // Group strictly per window to avoid cross-window errors
+                                const tabsByWindow = new Map();
+                                for (const tabId of finalCheckTabs) {
+                                    try {
+                                        const t = await chrome.tabs.get(tabId);
+                                        const list = tabsByWindow.get(t.windowId) || [];
+                                        list.push(tabId);
+                                        tabsByWindow.set(t.windowId, list);
+                                    } catch (_) {}
+                                }
+
+                                let anyGroupId = null;
+                                // Helper: ensure window is in a state that allows grouping
+                                const ensureWindowReady = async (winId) => {
+                                    try {
+                                        let info = await chrome.windows.get(winId);
+                                        const originalState = info.state;
+                                        // Grouping works reliably in 'normal' or 'maximized'. Exit fullscreen if needed.
+                                        if (!['normal', 'maximized'].includes(info.state)) {
+                                            await chrome.windows.update(winId, { state: 'normal', focused: true }).catch(() => {});
+                                            // Poll a few times for the state to settle
+                                            const start = Date.now();
+                                            while (Date.now() - start < 1200) {
+                                                await new Promise(r => setTimeout(r, 150));
+                                                info = await chrome.windows.get(winId);
+                                                if (['normal', 'maximized'].includes(info.state)) break;
+                                            }
+                                        } else {
+                                            // Nudge focus to improve reliability
+                                            await chrome.windows.update(winId, { focused: true }).catch(() => {});
+                                        }
+                                        return { ok: ['normal', 'maximized'].includes((await chrome.windows.get(winId)).state), originalState };
+                                    } catch (e) {
+                                        console.warn('Window readiness check failed:', e?.message || e);
+                                        return { ok: false, originalState: 'normal' };
+                                    }
+                                };
+
+                                for (const [winId, tabIds] of tabsByWindow.entries()) {
+                                    try {
+                                        let wInfo = await chrome.windows.get(winId);
+                                        if (wInfo.type !== 'normal') {
+                                            console.log(`⏭️ Skipping subgroup in non-normal window ${winId} (type=${wInfo.type})`);
+                                            continue;
+                                        }
+                                        if (tabIds.length < 2) {
+                                            console.log(`⏭️ Skipping subgroup in window ${winId} - fewer than 2 tabs`);
+                                            continue;
+                                        }
+                                        const readiness = await ensureWindowReady(winId);
+                                        if (!readiness.ok) {
+                                            console.log(`⏭️ Skipping subgroup in window ${winId} - window not ready (state remains ${wInfo.state})`);
+                                            continue;
+                                        }
+                                        const shouldRestore = wInfo.state === 'fullscreen';
+
+                                        const subGroupId = await chrome.tabs.group({ tabIds });
+                                        await chrome.tabGroups.update(subGroupId, {
+                                            title: group.name,
+                                            color: getGroupColor(group.name)
+                                        });
+                                        anyGroupId = anyGroupId || subGroupId;
+                                        tabIds.forEach(tabId => {
+                                            const tab = tabData.find(t => t.id === tabId);
+                                            console.log(`  📄 Tab ${tabId}: "${tab?.title || 'Unknown'}" (${tab?.domain || 'Unknown domain'})`);
+                                        });
+                                        console.log(`✅ Sub-group created in window ${winId} with ID: ${subGroupId} (${tabIds.length} tabs)`);
+
+                                        // restore fullscreen if we changed it
+                                        if (shouldRestore) {
+                                            try {
+                                                await chrome.windows.update(winId, { state: 'fullscreen' });
+                                            } catch (restoreErr) {
+                                                console.warn(`Could not restore fullscreen for window ${winId}:`, restoreErr?.message || restoreErr);
+                                            }
+                                        }
+                                    } catch (subErr) {
+                                        console.warn(`Sub-group creation failed in window ${winId}:`, subErr?.message || subErr);
+                                    }
+                                }
+
+                                if (anyGroupId) {
+                                    group.chromeGroupId = anyGroupId;
+                                    group.autoSuspended = false;
+                                    group.lastActive = 0;
+                                    const initialState = { lastActive: 0, suspended: false };
+                                    groupActivityState.set(anyGroupId, initialState);
+                                } else {
+                                    console.log(`⏭️ Skipping group "${group.name}" - could not create any tab group`);
+                                }
                             } else {
                                 console.log(`⏭️ Skipping group "${group.name}" - no tabs passed final check`);
                             }
@@ -3233,12 +3498,57 @@ function getGroupColor(groupName) {
     return 'cyan'; // default for unknown categories
 }
 
+// Simple fallback summarization when Chrome AI Summarizer isn't available
+function buildFallbackSummary(groupTabs) {
+    try {
+        const bullets = [];
+        const titles = groupTabs.map(t => t?.title).filter(Boolean);
+        const hosts = groupTabs.map(t => {
+            try { return new URL(t.url).hostname; } catch { return null; }
+        }).filter(Boolean);
+        const hostCounts = hosts.reduce((acc, h) => (acc[h] = (acc[h] || 0) + 1, acc), {});
+        const topHosts = Object.entries(hostCounts)
+            .sort((a,b) => b[1]-a[1])
+            .slice(0, 3)
+            .map(([h,c]) => `${h} (${c})`);
+
+        if (titles.length) {
+            bullets.push(`Representative tabs: ${titles.slice(0, 2).join(' • ')}`);
+        }
+        if (topHosts.length) {
+            bullets.push(`Main sites: ${topHosts.join(', ')}`);
+        }
+        const words = titles.join(' ').toLowerCase().split(/[^a-zα-ωάέίήόύώ0-9]+/).filter(w => w.length > 3);
+        const freq = words.reduce((acc, w) => (acc[w] = (acc[w] || 0) + 1, acc), {});
+        const keywords = Object.entries(freq)
+            .filter(([w]) => !['recently','official','news','update','home','login','google','openai','tech','blog','site','www'].includes(w))
+            .sort((a,b) => b[1]-a[1])
+            .slice(0, 5)
+            .map(([w]) => w);
+        if (keywords.length) {
+            bullets.push(`Keywords: ${keywords.join(', ')}`);
+        }
+        if (bullets.length === 0) bullets.push('Summary unavailable (no content).');
+        return bullets.slice(0, 5);
+    } catch (_) {
+        return ['Summary temporarily unavailable.'];
+    }
+}
+
 
 /**
  * Εκτελεί AI summarization χρησιμοποιώντας content script
  */
 async function performAISummarization(groupContent) {
     try {
+        // Check if we've previously determined summarizer is unavailable
+        try {
+            const { summarizerStatus } = await chrome.storage.session.get(['summarizerStatus']);
+            if (summarizerStatus && summarizerStatus.unavailableUntil && Date.now() < summarizerStatus.unavailableUntil) {
+                const reason = summarizerStatus.reason || 'Summarizer temporarily unavailable';
+                throw new Error(reason);
+            }
+        } catch (_) {}
         // Βρίσκουμε ένα tab που μπορούμε να χρησιμοποιήσουμε για AI
         // Αποκλείουμε chrome:// URLs
     const tabs = await chrome.tabs.query({});
@@ -3405,6 +3715,16 @@ async function performAISummarization(groupContent) {
                     : (() => { try { return JSON.stringify(errorInfo.rawSummary); } catch { return String(errorInfo.rawSummary); } })();
                 rawSnippet = ` Raw summary snippet: ${raw.slice(0, 200)}`;
             }
+            // Detect low disk space / on-device model download issues and mark summarizer unavailable
+            const msg = String(errorInfo.message || '').toLowerCase();
+            if (msg.includes('not have enough space') || msg.includes('notallowederror')) {
+                try {
+                    await chrome.storage.session.set({ summarizerStatus: {
+                        unavailableUntil: Date.now() + SUMMARIZER_UNAVAILABLE_TTL_MS,
+                        reason: errorInfo.message || 'Chrome AI summarizer unavailable'
+                    }});
+                } catch (_) {}
+            }
             throw new Error(`AI summarization content script error: ${errorInfo.message || 'Unknown error'}${rawSnippet}`);
         }
         
@@ -3418,6 +3738,16 @@ async function performAISummarization(groupContent) {
         
     } catch (error) {
         console.error('Error in AI summarization:', error);
+        // Persist unavailability for well-known capacity errors
+        try {
+            const msg = String(error?.message || '').toLowerCase();
+            if (msg.includes('not have enough space') || msg.includes('notallowederror')) {
+                await chrome.storage.session.set({ summarizerStatus: {
+                    unavailableUntil: Date.now() + SUMMARIZER_UNAVAILABLE_TTL_MS,
+                    reason: error.message
+                }});
+            }
+        } catch (_) {}
         throw new Error(`AI summarization failed: ${error.message}`);
     }
 }
@@ -5962,8 +6292,39 @@ function mergeSimilarNamedGroups(groups, featureContext, { debugLog = null } = {
         return { score: best, pair: bestPair };
     };
     
+    const isGamingGroup = (g) => {
+        const s = ((g?.name || '') + ' ' + (Array.isArray(g?.keywords) ? g.keywords.join(' ') : '')).toLowerCase();
+        return /(players|ultimate|team|fut|squad|ratings|futbin|fut\.gg|ea sports fc)/.test(s) || (g?.primaryTopic === 'gaming');
+    };
+    const isShoppingGroup = (g) => {
+        const s = ((g?.name || '') + ' ' + (Array.isArray(g?.keywords) ? g.keywords.join(' ') : '')).toLowerCase();
+        return (g?.primaryTopic === 'shopping') || detectShoppingStrong(s, '');
+    };
+    const isMedicalGroup = (g) => {
+        const s = ((g?.name || '') + ' ' + (Array.isArray(g?.keywords) ? g.keywords.join(' ') : '')).toLowerCase();
+        return /(pubmed|nejm|medical|health|who)/.test(s) || (g?.primaryTopic === 'medical');
+    };
+    const isTechNewsGroup = (g) => {
+        const s = ((g?.name || '') + ' ' + (Array.isArray(g?.keywords) ? g.keywords.join(' ') : '')).toLowerCase();
+        return /(tech|news|ai|openai|techcrunch|the verge|google)/.test(s) || (g?.primaryTopic === 'technology');
+    };
+
     for (let i = 0; i < groups.length; i++) {
         for (let j = i + 1; j < groups.length; j++) {
+            // Guard: do not merge across major categories (gaming/shopping/medical/tech)
+            const ga = isGamingGroup(groups[i]);
+            const gb = isGamingGroup(groups[j]);
+            if (ga !== gb) continue;
+            const sa = isShoppingGroup(groups[i]);
+            const sb = isShoppingGroup(groups[j]);
+            if (sa !== sb) continue;
+            const ma = isMedicalGroup(groups[i]);
+            const mb = isMedicalGroup(groups[j]);
+            if (ma !== mb) continue;
+            const ta = isTechNewsGroup(groups[i]);
+            const tb = isTechNewsGroup(groups[j]);
+            if (ta !== tb) continue;
+
             const tokensA = nameTokenSets[i];
             const tokensB = nameTokenSets[j];
             if (!tokensA.size || !tokensB.size) {
@@ -6433,6 +6794,10 @@ async function processDeferredSummaries() {
 }
 
 async function handleGroupSummaryRequest(groupIndex) {
+    // Short-circuit if summarizer previously marked unavailable
+    const statusData = await chrome.storage.session.get(['summarizerStatus']);
+    const summarizerStatus = statusData.summarizerStatus || null;
+    const summarizerBlocked = summarizerStatus && summarizerStatus.unavailableUntil && Date.now() < summarizerStatus.unavailableUntil;
     if (!Array.isArray(aiGroups) || !aiGroups.length) {
         try {
             const storedGroups = await chrome.storage.local.get(['cachedGroups']);
@@ -6487,10 +6852,22 @@ async function handleGroupSummaryRequest(groupIndex) {
     const groupContent = createGroupContentForSummarizer(groupTabs);
     const summaryStart = nowMs();
     group.summaryPending = true;
-    const summary = await performAISummarization(groupContent);
-    group.summary = summary;
-    group.summaryPending = false;
-    logTiming(`Group ${groupIndex} summarization`, summaryStart);
+    try {
+        if (summarizerBlocked) {
+            throw new Error(summarizerStatus.reason || 'Summarizer temporarily unavailable');
+        }
+        const summary = await performAISummarization(groupContent);
+        group.summary = summary;
+        group.summaryPending = false;
+        logTiming(`Group ${groupIndex} summarization`, summaryStart);
+    } catch (error) {
+        console.warn('Summarizer unavailable or failed, using fallback:', error?.message || error);
+        // Fallback summary based on tab titles/domains
+        const fallback = buildFallbackSummary(groupTabs);
+        group.summary = fallback;
+        group.summaryPending = false;
+        logTiming(`Group ${groupIndex} summarization (fallback)`, summaryStart);
+    }
     
     if (group.centroidSignature) {
         groupSummaryCache[group.centroidSignature] = {
@@ -6501,7 +6878,7 @@ async function handleGroupSummaryRequest(groupIndex) {
     }
     
     await synchronizeCachedGroups();
-    return { success: true, summary, source: 'generated' };
+    return { success: true, summary: group.summary, source: 'generated' };
 }
 
 /**
