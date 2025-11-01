@@ -572,7 +572,40 @@ function createTabItem(tabIndex) {
 function toggleGroup(groupIndex, contentElement) {
     const isExpanded = contentElement.classList.toggle('expanded');
     if (isExpanded) {
+        ensureGroupActions(contentElement, groupIndex);
         requestGroupSummary(groupIndex, contentElement);
+    }
+}
+
+function ensureGroupActions(contentElement, groupIndex) {
+    let actions = contentElement.querySelector('.group-actions');
+    if (!actions) {
+        actions = document.createElement('div');
+        actions.className = 'group-actions';
+        actions.style.margin = '6px 0 10px 0';
+        actions.style.display = 'flex';
+        actions.style.gap = '8px';
+
+        const synthBtn = document.createElement('button');
+        synthBtn.className = 'action-btn';
+        synthBtn.textContent = '✨ Generate Full AI Synthesis Report';
+        synthBtn.style.padding = '6px 10px';
+        synthBtn.addEventListener('click', async (e) => {
+            e.stopPropagation();
+            try {
+                showTemporaryMessage('🧠 Opening AI synthesis...');
+                const resp = await chrome.runtime.sendMessage({ type: 'SYNTHESIZE_GROUP', groupIndex });
+                if (!resp || !resp.success) {
+                    const err = resp?.error || 'Failed to start synthesis';
+                    showTemporaryMessage(`⚠️ ${err}`);
+                }
+            } catch (err) {
+                showTemporaryMessage(`⚠️ ${err.message}`);
+            }
+        });
+
+        actions.appendChild(synthBtn);
+        contentElement.insertBefore(actions, contentElement.firstChild);
     }
 }
 

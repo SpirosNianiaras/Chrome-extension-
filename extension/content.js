@@ -454,84 +454,93 @@ async function performAISummarization(groupContent) {
 }
 
 // Message handling για communication με background script
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-    console.log('Content script: Received message:', message.type);
-    
-    switch (message.type) {
-        case 'AI_GROUPING_PREWARM':
-            ensureLanguageModelReady()
-                .then(ok => sendResponse({ success: !!ok }))
-                .catch(err => sendResponse({ success: false, error: err?.message || String(err) }));
-            return true;
-        case 'PERFORM_AI_GROUPING':
-        case 'AI_GROUPING_REQUEST':
-            console.log('Content script: Received AI grouping request');
-            console.log('Content script: Message data type:', typeof message.data);
-            console.log('Content script: Message data length:', message.data?.length || 'no length');
-            console.log('Content script: AITabCompanion available:', typeof window.AITabCompanion !== 'undefined');
-            console.log('Content script: performAIGrouping available:', typeof window.AITabCompanion?.performAIGrouping);
+// Guard against rare cases where page code shadows window.chrome or when executed in the wrong world
+try {
+    if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.onMessage && typeof chrome.runtime.onMessage.addListener === 'function') {
+        chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+            console.log('Content script: Received message:', message.type);
             
-            if (typeof window.AITabCompanion !== 'undefined' && window.AITabCompanion.performAIGrouping) {
-                console.log('Content script: Using AITabCompanion.performAIGrouping');
-                const prompt = message.prompt || message.data;
-                performAIGrouping(prompt)
-                    .then(result => {
-                        console.log('Content script: AI grouping successful:', result);
-                        console.log('Content script: AI grouping result type:', typeof result);
-                        
-                        // Send response back to background script
-                        chrome.runtime.sendMessage({
-                            type: 'AI_GROUPING_RESPONSE',
-                            success: true,
-                            result: result
-                        });
-                        
-                        sendResponse({ success: true, result: result });
-                    })
-                    .catch(error => {
-                        console.error('Content script: AI grouping failed:', error);
+            switch (message.type) {
+                case 'AI_GROUPING_PREWARM':
+                    ensureLanguageModelReady()
+                        .then(ok => sendResponse({ success: !!ok }))
+                        .catch(err => sendResponse({ success: false, error: err?.message || String(err) }));
+                    return true;
+                case 'PERFORM_AI_GROUPING':
+                case 'AI_GROUPING_REQUEST':
+                    console.log('Content script: Received AI grouping request');
+                    console.log('Content script: Message data type:', typeof message.data);
+                    console.log('Content script: Message data length:', message.data?.length || 'no length');
+                    console.log('Content script: AITabCompanion available:', typeof window.AITabCompanion !== 'undefined');
+                    console.log('Content script: performAIGrouping available:', typeof window.AITabCompanion?.performAIGrouping);
+                    
+                    if (typeof window.AITabCompanion !== 'undefined' && window.AITabCompanion.performAIGrouping) {
+                        console.log('Content script: Using AITabCompanion.performAIGrouping');
+                        const prompt = message.prompt || message.data;
+                        performAIGrouping(prompt)
+                            .then(result => {
+                                console.log('Content script: AI grouping successful:', result);
+                                console.log('Content script: AI grouping result type:', typeof result);
+                                
+                                // Send response back to background script
+                                chrome.runtime.sendMessage({
+                                    type: 'AI_GROUPING_RESPONSE',
+                                    success: true,
+                                    result: result
+                                });
+                                
+                                sendResponse({ success: true, result: result });
+                            })
+                            .catch(error => {
+                                console.error('Content script: AI grouping failed:', error);
+                                
+                                // Send error response back to background script
+                                chrome.runtime.sendMessage({
+                                    type: 'AI_GROUPING_RESPONSE',
+                                    success: false,
+                                    error: error.message
+                                });
+                                
+                                sendResponse({ success: false, error: error.message });
+                            });
+                        return true; // Keep message channel open for async response
+                    } else {
+                        console.error('Content script: AITabCompanion not available');
+                        const error = 'AITabCompanion not available in content script';
                         
                         // Send error response back to background script
                         chrome.runtime.sendMessage({
                             type: 'AI_GROUPING_RESPONSE',
                             success: false,
-                            error: error.message
+                            error: error
                         });
                         
-                        sendResponse({ success: false, error: error.message });
-                    });
-                return true; // Keep message channel open for async response
-            } else {
-                console.error('Content script: AITabCompanion not available');
-                const error = 'AITabCompanion not available in content script';
-                
-                // Send error response back to background script
-                chrome.runtime.sendMessage({
-                    type: 'AI_GROUPING_RESPONSE',
-                    success: false,
-                    error: error
-                });
-                
-                sendResponse({ success: false, error });
+                        sendResponse({ success: false, error });
+                    }
+                    
+                case 'PERFORM_AI_SUMMARIZATION':
+                    performAISummarization(message.data)
+                        .then(result => {
+                            console.log('Content script: AI summarization successful:', result);
+                            sendResponse({ success: true, result: result });
+                        })
+                        .catch(error => {
+                            console.error('Content script: AI summarization failed:', error);
+                            sendResponse({ success: false, error: error.message });
+                        });
+                    return true; // Keep message channel open for async response
+                    
+                default:
+                    console.warn('Content script: Unknown message type:', message.type);
+                    sendResponse({ success: false, error: 'Unknown message type' });
             }
-            
-        case 'PERFORM_AI_SUMMARIZATION':
-            performAISummarization(message.data)
-                .then(result => {
-                    console.log('Content script: AI summarization successful:', result);
-                    sendResponse({ success: true, result: result });
-                })
-                .catch(error => {
-                    console.error('Content script: AI summarization failed:', error);
-                    sendResponse({ success: false, error: error.message });
-                });
-            return true; // Keep message channel open for async response
-            
-        default:
-            console.warn('Content script: Unknown message type:', message.type);
-            sendResponse({ success: false, error: 'Unknown message type' });
+        });
+    } else {
+        console.warn('Content script: chrome.runtime.onMessage not available in this context');
     }
-});
+} catch (e) {
+    console.warn('Content script: Failed to attach onMessage listener:', e?.message || e);
+}
 
 // Export functions για χρήση από background script
 if (typeof window !== 'undefined') {

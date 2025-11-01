@@ -10,6 +10,7 @@
     "windows",
     "scripting", 
     "activeTab",
+    "contextMenus",
     "storage"
   ],
   

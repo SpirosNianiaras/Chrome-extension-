@@ -40,6 +40,29 @@ const RUN = {
     reset: () => (RUN._id = null)
 };
 
+// Prefix every console log with the current runId for easy tracing
+(() => {
+    try {
+        const scope = (typeof self !== 'undefined' ? self : (typeof window !== 'undefined' ? window : globalThis));
+        if (scope && !scope.__runLogPatched) {
+            scope.__runLogPatched = true;
+            const orig = {
+                log: console.log.bind(console),
+                info: console.info?.bind(console) || console.log.bind(console),
+                warn: console.warn?.bind(console) || console.log.bind(console),
+                error: console.error?.bind(console) || console.log.bind(console),
+                debug: console.debug?.bind(console) || console.log.bind(console)
+            };
+            const prefix = () => `[run:${RUN.id()}]`;
+            console.log = (...args) => orig.log(prefix(), ...args);
+            console.info = (...args) => orig.info(prefix(), ...args);
+            console.warn = (...args) => orig.warn(prefix(), ...args);
+            console.error = (...args) => orig.error(prefix(), ...args);
+            console.debug = (...args) => orig.debug(prefix(), ...args);
+        }
+    } catch (_) { /* no-op */ }
+})();
+
 const LOGS = [];
 const MAX_LOGS = 5000; // Prevent memory issues
 
@@ -114,6 +137,25 @@ if (typeof chrome !== 'undefined' && chrome.runtime) {
     if (chrome.runtime.onStartup && typeof chrome.runtime.onStartup.addListener === 'function') {
         chrome.runtime.onStartup.addListener(async () => {
             console.log('🔁 [Boot] Chrome runtime startup event; service worker active');
+            // Ensure context menu exists on startup (service worker restarts)
+            try {
+                if (chrome.contextMenus && typeof chrome.contextMenus.create === 'function') {
+                const items = [
+                    { id: 'synthesizeGroup', title: '✨ Summarize & Compare Group (AI)', contexts: ['page'], documentUrlPatterns: ['http://*/*','https://*/*'] },
+                    { id: 'synthesizeActiveGroup', title: '✨ Summarize Active Tab Group (AI)', contexts: ['action'] }
+                ];
+                    for (const def of items) {
+                        chrome.contextMenus.create(def, () => {
+                            // Ignore duplicate errors when item already exists
+                            if (chrome.runtime.lastError && !/exist|duplicate/i.test(chrome.runtime.lastError.message)) {
+                                console.warn('Context menu create onStartup:', chrome.runtime.lastError.message);
+                            }
+                        });
+                    }
+                }
+            } catch (menuErr) {
+                console.warn('Failed to ensure context menu on startup:', menuErr?.message || menuErr);
+            }
             if (!AUTO_RELOAD_STALE_TABS || !STARTUP_SMART_RELOAD) return;
             try {
                 const tabs = await chrome.tabs.query({});
@@ -236,6 +278,14 @@ const RAM_MIN_TAB_AGE_MS = 30 * 1000;             // Only discard tabs older tha
 function nowMs() {
     return HAS_PERFORMANCE_API ? performance.now() : Date.now();
 }
+
+// ---- Generalization toggles ----
+// When true, prefer embedding-first similarity for grouping and use TF-IDF only as fallback
+const GENERAL_GROUPING_MODE = true;
+// In LLM refinement, consider top-K candidate groups (by embedding similarity) for singleton attachment
+const EMBED_TOPK_CANDIDATES = 3;
+// Disable shopping category split to avoid over-segmentation and singletons
+const ENABLE_SHOPPING_SPLIT = false;
 
 // ---- Generic detectors (content-based, domain-agnostic) ----
 function detectShoppingStrong(text = '', url = '') {
@@ -585,7 +635,54 @@ chrome.runtime.onInstalled.addListener(() => {
     // Καθαρισμός παλιών δεδομένων
     chrome.storage.session.clear();
     chrome.storage.local.remove(['lastScan', 'cachedGroups']);
+
+    // Δημιουργία context menu για One‑Click Synthesizer
+    try {
+        if (chrome.contextMenus && typeof chrome.contextMenus.create === 'function') {
+            chrome.contextMenus.removeAll(() => {
+                // Ignore lastError from removeAll in case none existed
+                const items = [
+                    // Use 'page' context (valid across Chrome channels) instead of unsupported 'tab'
+                    { id: 'synthesizeGroup', title: '✨ Summarize & Compare Group (AI)', contexts: ['page'], documentUrlPatterns: ['http://*/*','https://*/*'] },
+                    { id: 'synthesizeActiveGroup', title: '✨ Summarize Active Tab Group (AI)', contexts: ['action'] }
+                ];
+                for (const def of items) {
+                    try {
+                        chrome.contextMenus.create(def, () => {
+                            if (chrome.runtime.lastError && !/exist|duplicate/i.test(chrome.runtime.lastError.message)) {
+                                console.warn('Context menu create error:', chrome.runtime.lastError.message);
+                            }
+                        });
+                    } catch (innerErr) {
+                        console.warn('Context menu create threw:', innerErr?.message || innerErr);
+                    }
+                }
+            });
+        }
+    } catch (e) {
+        console.warn('Failed to initialize context menu on install:', e?.message || e);
+    }
 });
+
+// Context menu click handler for One‑Click Synthesizer
+if (chrome.contextMenus && chrome.contextMenus.onClicked) {
+    chrome.contextMenus.onClicked.addListener(async (info, tab) => {
+        try {
+            if (info.menuItemId === 'synthesizeGroup') {
+                const group = await findGroupByTabId(tab?.id);
+                if (group) {
+                    await createSummaryTab(group);
+                } else {
+                    console.warn('No AI group found for current tab');
+                }
+            } else if (info.menuItemId === 'synthesizeActiveGroup') {
+                await synthesizeActiveGroupFromAction();
+            }
+        } catch (e) {
+            console.warn('Context menu handler failed:', e?.message || e);
+        }
+    });
+}
 
 if (chrome.tabs?.onActivated) {
     chrome.tabs.onActivated.addListener(({ tabId }) => {
@@ -617,6 +714,17 @@ if (chrome.tabGroups?.onRemoved) {
             }
         }
     });
+}
+
+// Optional: if popup is disabled in the future, allow left-click on action to synthesize
+if (chrome.action && typeof chrome.action.onClicked?.addListener === 'function') {
+    try {
+        chrome.action.onClicked.addListener(async () => {
+            await synthesizeActiveGroupFromAction();
+        });
+    } catch (_) {
+        // ignore
+    }
 }
 
 /**
@@ -655,6 +763,30 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                     console.error('REQUEST_GROUP_SUMMARY failed:', error);
                     sendResponse({ success: false, error: error.message });
                 });
+            return true;
+
+        case 'SYNTHESIZE_GROUP':
+            (async () => {
+                try {
+                    // Ensure groups are available
+                    if (!Array.isArray(aiGroups) || !aiGroups.length) {
+                        const storedGroups = await chrome.storage.local.get(['cachedGroups']);
+                        if (Array.isArray(storedGroups.cachedGroups)) {
+                            aiGroups = storedGroups.cachedGroups;
+                        }
+                    }
+                    const idx = Number(message.groupIndex);
+                    if (!Array.isArray(aiGroups) || idx < 0 || idx >= aiGroups.length) {
+                        throw new Error('Invalid group index');
+                    }
+                    const group = aiGroups[idx];
+                    await createSummaryTab(group);
+                    sendResponse({ success: true });
+                } catch (e) {
+                    console.error('SYNTHESIZE_GROUP failed:', e);
+                    sendResponse({ success: false, error: e?.message || String(e) });
+                }
+            })();
             return true;
         
         case 'RUN_GOLDEN_EVAL':
@@ -2471,12 +2603,12 @@ async function executeAIGroupingWithTimeout(prompt, timeout) {
     console.log('🤖 [AI] Executing AI grouping with timeout:', timeout, 'ms');
     console.log('🤖 [AI] Prompt length:', prompt.length, 'characters');
 
-    // Find a usable tab (http/https)
-    let [active] = await chrome.tabs.query({ active: true, currentWindow: true });
-    let usableTab = active && active.url && active.url.startsWith('http') ? active : null;
+    // Prefer a lightweight, accessible tab for Chrome AI (avoid heavy/interactive pages)
+    let usableTab = await findUsableAIAccessTab();
     if (!usableTab) {
-        const httpTabs = await chrome.tabs.query({ url: ['http://*/*', 'https://*/*'] });
-        usableTab = httpTabs && httpTabs[0];
+        // Fallback to the active http(s) tab
+        let [active] = await chrome.tabs.query({ active: true, currentWindow: true });
+        usableTab = active && active.url && active.url.startsWith('http') ? active : null;
     }
     if (!usableTab) {
         console.warn('🤖 [AI] No usable tab found for messaging');
@@ -2509,19 +2641,65 @@ async function executeAIGroupingWithTimeout(prompt, timeout) {
     } catch (e) {
         // Content script may not be attached yet; attempt recovery quietly
         console.log('🤖 [AI] Prewarm not received; attempting recovery via injection...');
-        // Attempt to inject content script and retry once
+        // Attempt to inject content script and retry once (with timeout guard)
         try {
-            await chrome.scripting.executeScript({ target: { tabId: usableTab.id }, files: ['content.js'] });
+            await withTimeout(
+                chrome.scripting.executeScript({ target: { tabId: usableTab.id }, files: ['content.js'] }),
+                4000,
+                'Content script injection timeout'
+            );
             await new Promise(r => setTimeout(r, 150));
             const prewarm2 = await withTimeout(send('AI_GROUPING_PREWARM'), Math.min(5000, Math.max(2000, timeout - 2000)), 'LM prewarm timeout');
             console.log('🤖 [AI] Prewarm retry:', prewarm2);
             if (!prewarm2 || prewarm2.success !== true) {
-                console.warn('🤖 [AI] LM still not ready after injection');
+                console.warn('🤖 [AI] LM still not ready after injection — falling back to in‑page prompt execution');
+                // Fallback path: run LM directly in page context without messaging dependency
+                try {
+                    const results = await withTimeout(
+                        chrome.scripting.executeScript({
+                            target: { tabId: usableTab.id },
+                            world: 'MAIN',
+                            func: performAIGroupingInPage,
+                            args: [prompt]
+                        }),
+                        Math.min(timeout, 15000),
+                        'In‑page grouping timeout'
+                    );
+                    const payload = results && results[0] && results[0].result;
+                    if (payload && payload.ok && payload.result) {
+                        console.log('🤖 [AI] In‑page fallback succeeded');
+                        console.log('🤖🤖🤖 [AI CLUSTERING END] 🤖🤖🤖');
+                        return payload.result;
+                    }
+                } catch (fallbackErr) {
+                    console.warn('🤖 [AI] In‑page fallback failed:', fallbackErr?.message || fallbackErr);
+                }
                 console.log('🤖🤖🤖 [AI CLUSTERING END] 🤖🤖🤖');
                 return { keywords: [], confidence: 0.1 };
             }
         } catch (injErr) {
             console.warn('🤖 [AI] Injection failed:', injErr?.message || injErr);
+            // Try in‑page fallback even if injection failed
+            try {
+                const results = await withTimeout(
+                    chrome.scripting.executeScript({
+                        target: { tabId: usableTab.id },
+                        world: 'MAIN',
+                        func: performAIGroupingInPage,
+                        args: [prompt]
+                    }),
+                    Math.min(timeout, 15000),
+                    'In‑page grouping timeout'
+                );
+                const payload = results && results[0] && results[0].result;
+                if (payload && payload.ok && payload.result) {
+                    console.log('🤖 [AI] In‑page fallback (post-injection failure) succeeded');
+                    console.log('🤖🤖🤖 [AI CLUSTERING END] 🤖🤖🤖');
+                    return payload.result;
+                }
+            } catch (fallbackErr) {
+                console.warn('🤖 [AI] In‑page fallback failed after injection error:', fallbackErr?.message || fallbackErr);
+            }
             console.log('🤖🤖🤖 [AI CLUSTERING END] 🤖🤖🤖');
             return { keywords: [], confidence: 0.1 };
         }
@@ -3299,6 +3477,244 @@ function performCentroidFusion(groups, threshold) {
     }
 }
 
+/**
+ * AI Merge Pass: uses Prompt API (Gemini Nano) to merge semantically identical groups
+ * after TF-IDF/deterministic passes have completed.
+ */
+async function performAIMergePass(groups, tabDataForAI) {
+    try {
+        if (!Array.isArray(groups) || groups.length < 2) return groups;
+        const accessibleTab = await findUsableAIAccessTab();
+        if (!accessibleTab) return groups;
+
+        // Build candidate pairs using cheap heuristics to limit LM calls
+        const tok = (s) => String(s || '').toLowerCase().split(/[^a-z0-9α-ωάέίήύόώ]+/).filter(Boolean);
+        const jacc = (a, b) => {
+            const A = new Set((a || []).map(x => String(x).toLowerCase()));
+            const B = new Set((b || []).map(x => String(x).toLowerCase()));
+            if (!A.size && !B.size) return 0;
+            const inter = [...A].filter(x => B.has(x));
+            const uni = new Set([...A, ...B]);
+            return inter.length / (uni.size || 1);
+        };
+
+        const candidates = [];
+        for (let i = 0; i < groups.length; i++) {
+            for (let j = i + 1; j < groups.length; j++) {
+                const A = groups[i], B = groups[j];
+                // Skip obviously different high-level topics when both known
+                if (A.primaryTopic && B.primaryTopic && A.primaryTopic !== B.primaryTopic) {
+                    // Allow shopping↔shopping only
+                    if (!(/shopping/i.test(A.primaryTopic) && /shopping/i.test(B.primaryTopic))) {
+                        continue;
+                    }
+                }
+                const jw = jacc(A.keywords || [], B.keywords || []);
+                const nameSim = jacc(tok(A.name), tok(B.name));
+                if (jw >= 0.25 || nameSim >= 0.35 || (jw >= 0.15 && nameSim >= 0.25)) {
+                    candidates.push({ i, j, jw, nameSim });
+                }
+            }
+        }
+        // Sort best-first, cap to avoid too many LM calls
+        candidates.sort((a,b) => (b.jw + b.nameSim) - (a.jw + a.nameSim));
+        const MAX_CALLS = Math.min(18, Math.ceil(groups.length * 1.5));
+        const picked = candidates.slice(0, MAX_CALLS);
+
+        if (!picked.length) return groups;
+
+        // Make a working copy we can mutate
+        let current = groups.slice();
+        const removed = new Set();
+        const MAX_GROUP_SIZE = 12;
+
+        // Batch descriptors for a single LM session call
+        const buildDesc = (A,B) => ({
+            a: {
+                name: A.name || '',
+                topic: A.primaryTopic || '',
+                keywords: (A.keywords || []).slice(0, 6),
+                tags: (A.taxonomyTags || []).slice(0, 4)
+            },
+            b: {
+                name: B.name || '',
+                topic: B.primaryTopic || '',
+                keywords: (B.keywords || []).slice(0, 6),
+                tags: (B.taxonomyTags || []).slice(0, 4)
+            }
+        });
+        const pairs = [];
+        for (const { i, j } of picked) {
+            if (removed.has(i) || removed.has(j)) continue;
+            const A = current[i];
+            const B = current[j];
+            if (!A || !B) continue;
+            pairs.push({ i, j, desc: buildDesc(A,B) });
+        }
+        if (!pairs.length) return current.filter(Boolean);
+        try {
+            const results = await withTimeout(
+                chrome.scripting.executeScript({
+                    target: { tabId: accessibleTab.id },
+                    world: 'MAIN',
+                    func: areMultipleGroupsSameTaskInPage,
+                    args: [pairs.map(p => p.desc)]
+                }),
+                10000,
+                'AI batch merge timeout'
+            );
+            const payload = results && results[0] && results[0].result;
+            const decisions = (payload && payload.ok && Array.isArray(payload.results)) ? payload.results : [];
+            for (let idx = 0; idx < pairs.length && idx < decisions.length; idx += 1) {
+                const decision = decisions[idx];
+                if (!decision || decision.same !== true) continue;
+                const { i, j } = pairs[idx];
+                if (removed.has(i) || removed.has(j)) continue;
+                const A = current[i];
+                const B = current[j];
+                if (!A || !B) continue;
+                if ((A.tabIndices.length + B.tabIndices.length) > MAX_GROUP_SIZE) {
+                    console.log(`⏸️ [AI Merge] Skipping over-merge: ${A.tabIndices.length}+${B.tabIndices.length}`);
+                    continue;
+                }
+                console.log('🧠 [AI Merge] Merging groups by LLM decision:', {
+                    a: A.name, b: B.name, reason: decision.reason || 'same task'
+                });
+                const merged = mergeFusionGroups(A, B, 0.9);
+                current[i] = merged;
+                current[j] = null;
+                removed.add(j);
+            }
+        } catch (_) {
+            // Skip batch if model unavailable
+        }
+        // Compact list
+        return current.filter(Boolean);
+    } catch (e) {
+        console.warn('AI merge pass failed:', e?.message || e);
+        return groups;
+    }
+}
+
+// Runs in MAIN world; uses LanguageModel API to answer if two groups are the same task/topic
+function areGroupsSameTaskInPage(descriptor) {
+    function resolveLanguageModelApi() {
+        const scope = typeof self !== 'undefined' ? self : (typeof window !== 'undefined' ? window : globalThis);
+        return (
+            scope?.LanguageModel ||
+            scope?.ai?.languageModel ||
+            scope?.aiOriginTrial?.languageModel ||
+            scope?.window?.ai?.languageModel ||
+            null
+        );
+    }
+    return (async () => {
+        const scope = typeof self !== 'undefined' ? self : (typeof window !== 'undefined' ? window : globalThis);
+        const api = resolveLanguageModelApi();
+        if (!api) return { ok: false, error: 'Language Model API not available' };
+        const recoverable = /(destroyed|closed|reset|disconnected|terminated)/i;
+        async function getSession(forceReset = false) {
+            if (forceReset) scope.__aitabLanguageSessionPromise = null;
+            if (!scope.__aitabLanguageSessionPromise) {
+                scope.__aitabLanguageSessionPromise = api.create();
+            }
+            return scope.__aitabLanguageSessionPromise;
+        }
+        const a = descriptor?.a || {}; const b = descriptor?.b || {};
+        const pack = (g) => [
+            g.name ? `Name: ${g.name}` : '',
+            g.topic ? `Topic: ${g.topic}` : '',
+            Array.isArray(g.keywords) && g.keywords.length ? `Keywords: ${g.keywords.join(', ')}` : '',
+            Array.isArray(g.tags) && g.tags.length ? `Tags: ${g.tags.join(', ')}` : ''
+        ].filter(Boolean).join('\n');
+        const prompt = `You are a concise assistant. Decide if two groups represent the same user task/topic.
+Respond ONLY with JSON: {"same":true|false, "reason":"..."}
+
+Group A:\n${pack(a)}
+
+Group B:\n${pack(b)}
+`;
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+            try {
+                const session = await getSession(attempt === 1);
+                const raw = await session.prompt(prompt);
+                const match = typeof raw === 'string' ? raw.match(/\{[\s\S]*\}/) : null;
+                const parsed = match ? JSON.parse(match[0]) : JSON.parse(String(raw));
+                const same = Boolean(parsed.same === true || String(parsed.same).toLowerCase() === 'yes');
+                const reason = String(parsed.reason || '').slice(0, 140);
+                return { ok: true, same, reason };
+            } catch (e) {
+                const msg = e?.message || String(e);
+                if (recoverable.test(msg) && attempt === 0) { scope.__aitabLanguageSessionPromise = null; continue; }
+                return { ok: false, error: msg };
+            }
+        }
+        return { ok: false, error: 'unavailable' };
+    })();
+}
+
+// Batch version: evaluates multiple pairs within one session to reduce overhead
+function areMultipleGroupsSameTaskInPage(descriptors) {
+    function resolveLanguageModelApi() {
+        const scope = typeof self !== 'undefined' ? self : (typeof window !== 'undefined' ? window : globalThis);
+        return (
+            scope?.LanguageModel ||
+            scope?.ai?.languageModel ||
+            scope?.aiOriginTrial?.languageModel ||
+            scope?.window?.ai?.languageModel ||
+            null
+        );
+    }
+    return (async () => {
+        const scope = typeof self !== 'undefined' ? self : (typeof window !== 'undefined' ? window : globalThis);
+        const api = resolveLanguageModelApi();
+        if (!api) return { ok: false, error: 'Language Model API not available' };
+        const recoverable = /(destroyed|closed|reset|disconnected|terminated)/i;
+        async function getSession(forceReset = false) {
+            if (forceReset) scope.__aitabLanguageSessionPromise = null;
+            if (!scope.__aitabLanguageSessionPromise) {
+                scope.__aitabLanguageSessionPromise = api.create();
+            }
+            return scope.__aitabLanguageSessionPromise;
+        }
+        const safe = (g) => [
+            g.name ? `Name: ${g.name}` : '',
+            g.topic ? `Topic: ${g.topic}` : '',
+            Array.isArray(g.keywords) && g.keywords.length ? `Keywords: ${g.keywords.join(', ')}` : '',
+            Array.isArray(g.tags) && g.tags.length ? `Tags: ${g.tags.join(', ')}` : ''
+        ].filter(Boolean).join('\n');
+        const out = [];
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+            try {
+                const session = await getSession(attempt === 1);
+                for (const desc of (Array.isArray(descriptors) ? descriptors : [])) {
+                    const a = desc?.a || {}; const b = desc?.b || {};
+                    const prompt = `You are a concise assistant. Decide if two groups represent the same user task/topic.\n` +
+                        `Respond ONLY with JSON: {\"same\":true|false, \"reason\":\"...\"}\n\n` +
+                        `Group A:\n${safe(a)}\n\nGroup B:\n${safe(b)}\n`;
+                    let parsed = { same: false, reason: '' };
+                    try {
+                        const raw = await session.prompt(prompt);
+                        const match = typeof raw === 'string' ? raw.match(/\{[\s\S]*\}/) : null;
+                        const obj = match ? JSON.parse(match[0]) : JSON.parse(String(raw));
+                        parsed.same = Boolean(obj.same === true || String(obj.same).toLowerCase() === 'yes');
+                        parsed.reason = String(obj.reason || '').slice(0, 140);
+                    } catch (_) {
+                        parsed = { same: false, reason: '' };
+                    }
+                    out.push(parsed);
+                }
+                return { ok: true, results: out };
+            } catch (e) {
+                const msg = e?.message || String(e);
+                if (recoverable.test(msg) && attempt === 0) { scope.__aitabLanguageSessionPromise = null; continue; }
+                return { ok: false, error: msg };
+            }
+        }
+        return { ok: false, error: 'unavailable' };
+    })();
+}
+
 // ---- Post-run RAM cleanup ----
 function schedulePostRunRamCleanup(groups, tabData) {
     try {
@@ -3393,6 +3809,9 @@ function isBridge(tab) {
  * Εκτελεί AI ανάλυση των tabs χρησιμοποιώντας Chrome Built-in AI APIs
  */
 async function performAIAnalysis() {
+    // New run boundary: reset and assign a fresh run id
+    RUN.reset();
+    const run = RUN.id();
     let aiStart = nowMs();
     try {
         console.log('Starting AI analysis with Chrome Built-in AI...');
@@ -3504,16 +3923,20 @@ async function performAIAnalysis() {
             console.warn('Purity enforcement failed:', purityErr?.message || purityErr);
         }
 
-        // Further split shopping groups by category/merchant for better clarity
-        try {
-            const beforeShop = groups.length;
-            groups = splitShoppingCategories(groups, tabDataForAI);
-            const afterShop = groups.length;
-            if (afterShop !== beforeShop) {
-                console.log(`🛍️ [Shopping Split] Refined shopping groups (${beforeShop} → ${afterShop} groups)`);
+        // Optional shopping split (disabled by default to prevent over-segmentation)
+        if (ENABLE_SHOPPING_SPLIT) {
+            try {
+                const beforeShop = groups.length;
+                groups = splitShoppingCategories(groups, tabDataForAI);
+                const afterShop = groups.length;
+                if (afterShop !== beforeShop) {
+                    console.log(`🛍️ [Shopping Split] Refined shopping groups (${beforeShop} → ${afterShop} groups)`);
+                }
+            } catch (shopErr) {
+                console.warn('Shopping split failed:', shopErr?.message || shopErr);
             }
-        } catch (shopErr) {
-            console.warn('Shopping split failed:', shopErr?.message || shopErr);
+        } else {
+            console.log('🛍️ [Shopping Split] Skipped (disabled)');
         }
         
         // Create featureContext for compatibility with existing code
@@ -3575,6 +3998,15 @@ async function performAIAnalysis() {
             await assignGroupLabels(groups, tabDataForAI);
         } else {
             groups = mergedByName;
+        }
+        
+        // Optional: AI Merge Pass to fix TF-IDF over-segmentation using Prompt API
+        try {
+            const aiMergeStart = nowMs();
+            groups = await performAIMergePass(groups, tabDataForAI);
+            logTiming('AI merge pass', aiMergeStart);
+        } catch (aimErr) {
+            console.warn('AI merge pass skipped:', aimErr?.message || aimErr);
         }
         logTiming('Group labeling & merge refinement', oldLabelingStart);
         
@@ -5369,28 +5801,25 @@ async function ensureTabEmbeddings(tabDataForAI) {
         return combined;
     };
     
-    const computeFallbackEmbedding = (entry) => {
-        const tokens = [
-            ...tokenizeText(entry.title),
-            ...tokenizeText(entry.semanticFeatures?.topic),
-            ...(entry.semanticFeatures?.keywords || []).map(keyword => keyword.toLowerCase()),
-            ...tokenizeText(entry.metaDescription),
-            ...tokenizeText(entry.topicHints),
-            ...tokenizeText(entry.youtubeTopic),
-            ...(entry.youtubeTags || []).map(tag => String(tag || '').toLowerCase())
-        ].slice(0, 48);
-        
-        const vector = new Array(EMBEDDING_FALLBACK_DIM).fill(0);
-        tokens.forEach((token, index) => {
-            if (!token || STOPWORDS.has(token)) return;
-            const bucket = positiveHash(`${token}:${index}`) % EMBEDDING_FALLBACK_DIM;
-            vector[bucket] += 1;
-        });
-        
-        const norm = Math.sqrt(vector.reduce((sum, value) => sum + value * value, 0)) || 1;
-        return vector.map(value => value / norm);
-    };
+    // Note: We intentionally removed hashed BoW fallback. If embeddings fail,
+    // computeWeightedSimilarity will fall back to TF-IDF cosine when comparing.
     
+    async function ensureAIAccessTab() {
+        // Try to find an existing light tab; if none, create one on a safe origin
+        let tab = await findUsableAIAccessTab();
+        if (!tab) {
+            try {
+                tab = await chrome.tabs.create({ url: 'https://developer.chrome.com/', active: false });
+                // Give the page a brief moment to initialize
+                await new Promise(r => setTimeout(r, 400));
+            } catch (e) {
+                console.warn('Failed to create AI access tab:', e?.message || e);
+                tab = null;
+            }
+        }
+        return tab;
+    }
+
     const processEntry = async (entry) => {
         const originalTab = currentTabData[entry.index];
         if (Array.isArray(originalTab.semanticEmbedding) && originalTab.semanticEmbedding.length) {
@@ -5425,13 +5854,16 @@ async function ensureTabEmbeddings(tabDataForAI) {
                     keywords: entry.semanticFeatures?.keywords || [],
                     language: entry.language || ''
                 };
-                const scriptPromise = chrome.scripting.executeScript({
-                    target: { tabId: aiTabId },
-                    world: 'MAIN',
-                    func: generateTabEmbeddingInPage,
-                    args: [descriptor]
-                });
-                const results = await withTimeout(scriptPromise, AI_FEATURE_TIMEOUT, 'AI embedding timeout');
+                const runOnce = async (tabId) => {
+                    const scriptPromise = chrome.scripting.executeScript({
+                        target: { tabId },
+                        world: 'MAIN',
+                        func: generateTabEmbeddingInPage,
+                        args: [descriptor]
+                    });
+                    return withTimeout(scriptPromise, AI_FEATURE_TIMEOUT, 'AI embedding timeout');
+                };
+                let results = await runOnce(aiTabId);
                 if (results && results[0] && results[0].result) {
                     const payload = results[0].result;
                     if (payload.ok && Array.isArray(payload.embedding)) {
@@ -5440,7 +5872,23 @@ async function ensureTabEmbeddings(tabDataForAI) {
                     } else {
                         const reason = payload.error || 'Unknown embedding error';
                         const status = payload.status;
-                        if (status === 'downloading' || status === 'unavailable') {
+                        if (status === 'downloading' || status === 'downloadable') {
+                            console.warn('Embedding model not ready (downloading). Will retry with a new AI tab context.');
+                            aiTabId = null;
+                            // Try to acquire a fresh lightweight tab and retry once
+                            const newTab = await ensureAIAccessTab();
+                            if (newTab?.id) {
+                                aiTabId = newTab.id;
+                                try {
+                                    results = await runOnce(aiTabId);
+                                    if (results && results[0] && results[0].result && results[0].result.ok && Array.isArray(results[0].result.embedding)) {
+                                        embeddingVector = results[0].result.embedding.slice();
+                                        generatedCount += 1;
+                                    }
+                                } catch (_) {}
+                            }
+                        } else if (status === 'unavailable') {
+                            console.warn('Embedding model unavailable on this device; will use TF-IDF fallback when comparing.');
                             aiTabId = null;
                         }
                         failureReasons.add(reason);
@@ -5450,7 +5898,7 @@ async function ensureTabEmbeddings(tabDataForAI) {
                 if (error?.message === 'AI embedding timeout') {
                     failureReasons.add('Embedding model timeout');
                     aiTabId = null;
-                    console.warn('generateTabEmbeddingInPage timed out, falling back to hashed embedding.');
+                    console.warn('generateTabEmbeddingInPage timed out; comparisons will fall back to TF-IDF only.');
                 } else {
                     failureReasons.add(error?.message || String(error));
                 }
@@ -5460,27 +5908,25 @@ async function ensureTabEmbeddings(tabDataForAI) {
         if (!embeddingVector) {
             const reason = failureReasons.size
                 ? Array.from(failureReasons).slice(0, 3).join(' | ')
-                : 'unknown embedding failure';
-        console.log('ℹ️ [Chrome AI Challenge] Using fallback embeddings (Embedding Model API not available):', {
-            url: entry.url,
-            title: entry.title,
-            reason: reason,
-            note: 'This is expected - Embedding Model API requires special setup'
-        });
-            // Embeddings are optional - always use fallback if AI unavailable
-            embeddingVector = computeFallbackEmbedding(entry);
-            fallbackCount += 1;
+                : 'embedding generation failed';
+            console.warn('⚠️ Embedding generation failed; comparisons will fall back to TF-IDF only:', {
+                url: entry.url,
+                title: entry.title,
+                reason
+            });
+            // Do NOT synthesize hashed vectors. Rely on TF-IDF in computeWeightedSimilarity.
         }
         
-        entry.semanticEmbedding = embeddingVector.slice();
-        originalTab.semanticEmbedding = embeddingVector.slice();
-        
-        if (cacheKey) {
-            cacheUpdates[cacheKey] = {
-                timestamp: Date.now(),
-                vector: embeddingVector.slice(),
-                contentHash: entry.contentHash || originalTab.contentHash || ''
-            };
+        if (embeddingVector) {
+            entry.semanticEmbedding = embeddingVector.slice();
+            originalTab.semanticEmbedding = embeddingVector.slice();
+            if (cacheKey) {
+                cacheUpdates[cacheKey] = {
+                    timestamp: Date.now(),
+                    vector: embeddingVector.slice(),
+                    contentHash: entry.contentHash || originalTab.contentHash || ''
+                };
+            }
         }
     };
     
@@ -5686,73 +6132,71 @@ async function applyLLMRefinement(groups, featureContext, tabDataForAI) {
             const vectorIdx = group.vectorIndices?.[0];
             const tabIdx = group.tabIndices?.[0];
             if (typeof vectorIdx !== 'number' || typeof tabIdx !== 'number') continue;
-            
-            let bestScore = 0;
-            let bestGroupIndex = -1;
-            let bestVectorMatch = null;
-            
+
+            const tabA = tabDataForAI[tabIdx];
+            if (!tabA) continue;
+
+            // 1) Rank target groups by embedding-first similarity (max over vectors per group)
+            const scoredTargets = [];
             for (let targetIndex = 0; targetIndex < groups.length; targetIndex += 1) {
                 if (targetIndex === index || removedGroups.has(targetIndex)) continue;
                 const targetGroup = groups[targetIndex];
-                if (!targetGroup?.vectorIndices?.length) continue;
-                
-                for (const targetVectorIdx of targetGroup.vectorIndices) {
-                    const key = vectorIdx < targetVectorIdx ? `${vectorIdx}|${targetVectorIdx}` : `${targetVectorIdx}|${vectorIdx}`;
+                const vIdxs = Array.isArray(targetGroup?.vectorIndices) ? targetGroup.vectorIndices : [];
+                if (!vIdxs.length) continue;
+
+                let bestEmbed = 0;
+                for (const tV of vIdxs) {
+                    const key = vectorIdx < tV ? `${vectorIdx}|${tV}` : `${tV}|${vectorIdx}`;
                     let score = similarityCache.get(key);
                     if (typeof score !== 'number') {
-                        score = computeWeightedSimilarity(vectors[vectorIdx], vectors[targetVectorIdx]);
+                        score = computeWeightedSimilarity(vectors[vectorIdx], vectors[tV]);
                         similarityCache.set(key, score);
                     }
-                    if (score > bestScore) {
-                        bestScore = score;
-                        bestGroupIndex = targetIndex;
-                        bestVectorMatch = targetVectorIdx;
+                    if (score > bestEmbed) bestEmbed = score;
+                }
+                if (bestEmbed > 0) {
+                    scoredTargets.push({ targetIndex, score: bestEmbed });
+                }
+            }
+
+            if (!scoredTargets.length) continue;
+            scoredTargets.sort((a,b) => b.score - a.score);
+            const topK = scoredTargets.slice(0, EMBED_TOPK_CANDIDATES);
+
+            // 2) Ask LLM to decide best target among top-K (decider rather than mere validator)
+            let attached = false;
+            for (const cand of topK) {
+                const targetGroup = groups[cand.targetIndex];
+                const firstTargetTabIdx = targetGroup.tabIndices?.[0];
+                const tabB = typeof firstTargetTabIdx === 'number' ? tabDataForAI[firstTargetTabIdx] : null;
+                if (!tabB) continue;
+                try {
+                    const verification = await verifyTabPairWithLM(tabA, tabB);
+                    if (verification.sameTopic && verification.confidence >= LLM_VERIFICATION_CONFIDENCE) {
+                        vectorSets[cand.targetIndex].add(vectorIdx);
+                        tabSets[cand.targetIndex].add(tabIdx);
+                        removedGroups.add(index);
+                        mergePerformed = true;
+                        devlog({
+                            type: 'SINGLETON',
+                            action: 'ATTACH',
+                            url: tabA.url,
+                            key: tabKey(tabA),
+                            targetCluster: `group_${cand.targetIndex + 1}`,
+                            centroidCosine: round(cand.score),
+                            sameTopic: verification.sameTopic,
+                            confidence: round(verification.confidence),
+                            reason: verification.reason,
+                            threshold: round(LLM_VERIFICATION_CONFIDENCE)
+                        });
+                        attached = true;
+                        break;
                     }
+                } catch (e) {
+                    console.warn('LLM verification failed:', e?.message || e);
                 }
             }
-            
-            if (bestGroupIndex === -1 || bestScore < LLM_MERGE_SIMILARITY_FLOOR) {
-                continue;
-            }
-            
-            const tabA = tabDataForAI[tabIdx];
-            const targetTabIdx = groups[bestGroupIndex].tabIndices?.[0];
-            const tabB = typeof targetTabIdx === 'number' ? tabDataForAI[targetTabIdx] : null;
-            if (!tabA || !tabB) {
-                continue;
-            }
-            
-            try {
-                const verification = await verifyTabPairWithLM(tabA, tabB);
-                if (verification.sameTopic && verification.confidence >= LLM_VERIFICATION_CONFIDENCE) {
-                    vectorSets[bestGroupIndex].add(vectorIdx);
-                    tabSets[bestGroupIndex].add(tabIdx);
-                    removedGroups.add(index);
-                    mergePerformed = true;
-                    console.log('LLM refinement merged singleton tab into group:', {
-                        singletonTab: tabA.url,
-                        targetGroup: groups[bestGroupIndex].name || bestGroupIndex,
-                        confidence: verification.confidence,
-                        reason: verification.reason
-                    });
-                    
-                    // Log singleton attach
-                    devlog({
-                        type: 'SINGLETON',
-                        action: 'ATTACH',
-                        url: tabA.url,
-                        key: tabKey(tabA),
-                        targetCluster: `group_${bestGroupIndex + 1}`,
-                        centroidCosine: round(bestScore),
-                        sameTopic: verification.sameTopic,
-                        confidence: round(verification.confidence),
-                        reason: verification.reason,
-                        threshold: round(LLM_VERIFICATION_CONFIDENCE)
-                    });
-                }
-            } catch (verificationError) {
-                console.warn('LLM verification skipped for tab pair:', verificationError.message || verificationError);
-            }
+            // If not attached, leave singleton as-is
         }
         
         if (!mergePerformed) {
@@ -6075,148 +6519,20 @@ function prepareTabFeatureContext(tabDataForAI) {
 }
 
 function computeWeightedSimilarity(vectorA, vectorB, debugOut = null) {
-    const S_kw = jaccardSimilarity(vectorA.keywordTokens, vectorB.keywordTokens);
-    const S_topic = jaccardSimilarity(vectorA.semanticTopicTokens, vectorB.semanticTopicTokens);
-    const S_title = jaccardSimilarity(vectorA.titleTokens, vectorB.titleTokens);
-    const S_url = jaccardSimilarity(vectorA.pathTokens, vectorB.pathTokens);
-    const S_tfidf = cosineSimilarity(vectorA.tfidfVector, vectorB.tfidfVector);
-    const S_dom = vectorA.domain && vectorA.domain === vectorB.domain ? 1 : 0;
-    const S_domTokens = jaccardSimilarity(vectorA.domainTokens, vectorB.domainTokens);
-    const S_lang = vectorA.language && vectorA.language === vectorB.language ? 1 : 0;
-    const S_embed = cosineSimilarityArray(vectorA.embeddingVector, vectorB.embeddingVector);
-    const S_sim = simHashSimilarity(vectorA.simHash, vectorB.simHash);
-    const S_tax = normalizedOverlap(vectorA.taxonomyTags, vectorB.taxonomyTags);
-    const langPenalty = (!vectorA.language || !vectorB.language || vectorA.language === vectorB.language) ? 1 : 0.85;
-    const mergeSetA = new Set(
-        (vectorA.mergeHints || [])
-            .map(token => String(token || '').toLowerCase().trim())
-            .filter(token => token.length >= 3 && !STOPWORDS.has(token) && !GENERIC_MERGE_STOPWORDS.has(token))
-    );
-    const mergeSetB = new Set(
-        (vectorB.mergeHints || [])
-            .map(token => String(token || '').toLowerCase().trim())
-            .filter(token => token.length >= 3 && !STOPWORDS.has(token) && !GENERIC_MERGE_STOPWORDS.has(token))
-    );
-    const S_merge = jaccardSimilarity(mergeSetA, mergeSetB);
-    const primaryTokensA = new Set(
-        tokenizeText(vectorA.primaryTopic)
-            .filter(token => !GENERIC_MERGE_STOPWORDS.has(token))
-    );
-    const primaryTokensB = new Set(
-        tokenizeText(vectorB.primaryTopic)
-            .filter(token => !GENERIC_MERGE_STOPWORDS.has(token))
-    );
-    const S_primary = normalizedOverlap(primaryTokensA, primaryTokensB);
-    const docMatch = vectorA.docType && vectorA.docType === vectorB.docType ? 1 : 0;
-    const entitiesA = vectorA.entities instanceof Set
-        ? vectorA.entities
-        : new Set(Array.isArray(vectorA.entities) ? vectorA.entities : []);
-    const entitiesB = vectorB.entities instanceof Set
-        ? vectorB.entities
-        : new Set(Array.isArray(vectorB.entities) ? vectorB.entities : []);
-    const S_entity = normalizedOverlap(entitiesA, entitiesB);
-    const genericPenalty = (() => {
-        const aGeneric = Boolean(vectorA.isGenericLanding);
-        const bGeneric = Boolean(vectorB.isGenericLanding);
-        if (aGeneric && bGeneric) return 0.75;
-        if (aGeneric || bGeneric) return 0.65;
-        return 1;
-    })();
-    const entityPenalty = (() => {
-        if (!entitiesA.size || !entitiesB.size) return 1;
-        if (S_entity > 0) return 1;
-        const articlePair = vectorA.docType === 'article' && vectorB.docType === 'article';
-        return articlePair ? 0.92 : 0.6;
-    })();
-    const topicPenalty = (() => {
-        if (!primaryTokensA.size || !primaryTokensB.size) return 0.95;
-        if (S_primary > 0) return 1;
-        if (S_topic >= 0.36) return 0.9;
-        return 0.7;
-    })();
-    
-    let score =
-        (0.12 * S_kw) +
-        (0.17 * S_topic) +
-        (0.06 * S_title) +
-        (0.08 * S_tfidf) +
-        (0.14 * S_embed) +
-        (0.05 * S_sim) +
-        (0.07 * S_tax) +
-        (0.04 * S_url) +
-        (0.03 * S_dom) +
-        (0.02 * S_domTokens) +
-        (0.02 * S_lang) +
-        (0.07 * S_merge) +
-        (0.04 * docMatch) +
-        (0.04 * S_entity) +
-        (0.05 * S_primary);
-    
-    if (vectorA.youtubeTopic && vectorA.youtubeTopic === vectorB.youtubeTopic) {
-        score += 0.03;
+    // Embedding-first general similarity
+    const S_embed = cosineSimilarityArray(vectorA?.embeddingVector, vectorB?.embeddingVector);
+    if (GENERAL_GROUPING_MODE && typeof S_embed === 'number' && S_embed > 0) {
+        if (debugOut && typeof debugOut === 'object') debugOut.score = S_embed;
+        return Math.max(0, Math.min(S_embed, 1));
     }
-    
-    score *= langPenalty * genericPenalty * entityPenalty * topicPenalty;
-    const finalScore = Math.max(0, Math.min(score, 1));
-    
-    // Log pairwise similarity for debugging
-    devlog({
-        type: 'PAIR',
-        a: { 
-            url: vectorA.tabData?.url || 'unknown', 
-            key: tabKey(vectorA.tabData), 
-            primary_topic: vectorA.primaryTopic, 
-            tax: vectorA.taxonomyTags?.[0] || 'unknown' 
-        },
-        b: { 
-            url: vectorB.tabData?.url || 'unknown', 
-            key: tabKey(vectorB.tabData), 
-            primary_topic: vectorB.primaryTopic, 
-            tax: vectorB.taxonomyTags?.[0] || 'unknown' 
-        },
-        phase: 'A', // Tab-to-tab comparison
-        cosine: round(S_embed),
-        jaccardHints: round(S_merge),
-        taxBoost: round(S_tax),
-        genericPenalty: round(genericPenalty),
-        docTypeBoost: round(docMatch),
-        keywordBoost: round(S_kw),
-        topicBoost: round(S_primary),
-        entityBoost: round(S_entity),
-        finalScore: round(finalScore),
-        threshold: round(SIMILARITY_JOIN_THRESHOLD),
-        decision: finalScore >= SIMILARITY_JOIN_THRESHOLD ? 'MERGE' : 'SKIP',
-        penalties: {
-            lang: round(langPenalty),
-            generic: round(genericPenalty),
-            entity: round(entityPenalty),
-            topic: round(topicPenalty)
-        }
-    });
-    
-    if (debugOut && typeof debugOut === 'object') {
-        debugOut.S_kw = S_kw;
-        debugOut.S_topic = S_topic;
-        debugOut.S_title = S_title;
-        debugOut.S_tfidf = S_tfidf;
-        debugOut.S_embed = S_embed;
-        debugOut.S_sim = S_sim;
-        debugOut.S_tax = S_tax;
-        debugOut.S_url = S_url;
-        debugOut.S_dom = S_dom;
-        debugOut.S_domTokens = S_domTokens;
-        debugOut.S_lang = S_lang;
-        debugOut.S_merge = S_merge;
-        debugOut.docMatch = docMatch;
-        debugOut.langPenalty = langPenalty;
-        debugOut.genericPenalty = genericPenalty;
-        debugOut.S_primary = S_primary;
-        debugOut.topicPenalty = topicPenalty;
-        debugOut.S_entity = S_entity;
-        debugOut.entityPenalty = entityPenalty;
-        debugOut.score = finalScore;
+    // Fallback to TF-IDF cosine
+    const S_tfidf = cosineSimilarity(vectorA?.tfidfVector, vectorB?.tfidfVector);
+    if (typeof S_tfidf === 'number' && S_tfidf > 0) {
+        if (debugOut && typeof debugOut === 'object') debugOut.score = S_tfidf;
+        return Math.max(0, Math.min(S_tfidf, 1));
     }
-    return finalScore;
+    if (debugOut && typeof debugOut === 'object') debugOut.score = 0;
+    return 0;
 }
 
 function createUnionFind(size) {
@@ -7643,6 +7959,179 @@ async function processDeferredSummaries() {
     }
 }
 
+// Helper: Build synthesis descriptor for a group (similar to labeling)
+function prepareDescriptorForGroup(group) {
+    try {
+        const indexMap = new Map(currentTabData.map(entry => [entry.index, entry]));
+        const exemplarTabs = (group.representativeTabIndices || group.tabIndices || [])
+            .map(index => {
+                const entry = indexMap.get(index) || currentTabData[index] || {};
+                const features = entry.semanticFeatures || {};
+                const classification = entry.classification || {};
+                let domain = entry.domain || '';
+                if (!domain && entry.url) {
+                    try { domain = new URL(entry.url).hostname; } catch {}
+                }
+                return {
+                    title: entry.title || '',
+                    domain: domain || '',
+                    topic: features.topic || '',
+                    keywords: (features.mergeHints || features.keywords || []).slice(0, 5),
+                    primaryTopic: classification.primaryTopic || features.primaryTopic || '',
+                    docType: classification.docType || features.docType || '',
+                    entities: (classification.entities || features.entities || []).slice(0, 3),
+                    mergeHints: (classification.mergeHints || features.mergeHints || features.keywords || []).slice(0, 5)
+                };
+            })
+            .filter(tab => tab.title);
+        return {
+            centroidKeywords: (group.centroidTokens || group.keywords || []).slice(0, 6),
+            fallbackKeywords: (group.keywords || []).slice(0, 8),
+            exemplarTabs: exemplarTabs.slice(0, 3),
+            domainMode: group.domainMode || '',
+            languageMode: group.languageMode || '',
+            taxonomyTags: Array.isArray(group.taxonomyTags) ? group.taxonomyTags.slice(0, 6) : [],
+            primaryTopic: group.primaryTopic || '',
+            docType: group.docType || '',
+            mergeHints: Array.isArray(group.mergeHints) ? group.mergeHints.slice(0, 6) : [],
+            entities: Array.isArray(group.entities) ? group.entities.slice(0, 4) : []
+        };
+    } catch (e) {
+        console.warn('prepareDescriptorForGroup failed:', e?.message || e);
+        return {
+            centroidKeywords: Array.isArray(group?.keywords) ? group.keywords.slice(0, 6) : [],
+            exemplarTabs: [],
+            taxonomyTags: [],
+            primaryTopic: String(group?.primaryTopic || ''),
+            docType: String(group?.docType || '')
+        };
+    }
+}
+
+// Helper: Locate a group by the chrome tabId
+async function findGroupByTabId(tabId) {
+    if (!tabId) return null;
+    try {
+        if (!Array.isArray(aiGroups) || !aiGroups.length) {
+            const storedGroups = await chrome.storage.local.get(['cachedGroups']);
+            if (Array.isArray(storedGroups.cachedGroups)) {
+                aiGroups = storedGroups.cachedGroups;
+            }
+        }
+    } catch (_) {}
+    if (!Array.isArray(currentTabData) || !currentTabData.length) {
+        try {
+            const stored = await chrome.storage.local.get(['tabData']);
+            if (Array.isArray(stored.tabData)) {
+                currentTabData = stored.tabData;
+            }
+        } catch (_) {}
+    }
+    const idxInData = currentTabData.findIndex(t => t && t.id === tabId);
+    if (idxInData === -1) return null;
+    const group = Array.isArray(aiGroups) ? aiGroups.find(g => Array.isArray(g.tabIndices) && g.tabIndices.includes(idxInData)) : null;
+    return group || null;
+}
+
+// Main entry: Create a new tab with AI synthesis for a group
+async function createSummaryTab(groupData) {
+    try {
+        const accessibleTab = await findUsableAIAccessTab();
+        if (!accessibleTab) {
+            console.warn('No accessible tab available to run synthesis');
+            return;
+        }
+        const descriptor = prepareDescriptorForGroup(groupData);
+        const results = await chrome.scripting.executeScript({
+            target: { tabId: accessibleTab.id },
+            world: 'MAIN',
+            func: generateGroupSynthesisInPage,
+            args: [descriptor]
+        });
+        const payload = results && results[0] && results[0].result;
+        if (payload && payload.ok) {
+            const { subject, summary, insights } = payload;
+            const htmlContent = `
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>AI Synthesis: ${subject.replace(/</g,'&lt;')}</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { padding: 24px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Inter, 'Helvetica Neue', Arial, sans-serif; line-height: 1.55; color: #0f172a; background: #f8fafc; }
+    .card { max-width: 860px; margin: 0 auto; background: #fff; border-radius: 14px; box-shadow: 0 10px 30px rgba(2,6,23,.08); padding: 28px; }
+    h1 { font-size: 22px; margin: 0 0 12px; }
+    h2 { font-size: 18px; margin: 24px 0 8px; }
+    p { margin: 0 0 12px; }
+    ul { margin: 0; padding-left: 20px; }
+    li { margin: 6px 0; }
+    .meta { color: #475569; font-size: 12px; margin-top: 20px; }
+  </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>🧠 AI Synthesis for: ${subject.replace(/</g,'&lt;')}</h1>
+      <p>${summary.replace(/</g,'&lt;')}</p>
+      <h2>Key Insights</h2>
+      <ul>
+        ${(insights || []).map(i => `<li>${String(i).replace(/</g,'&lt;')}</li>`).join('')}
+      </ul>
+      <div class="meta">Source: analyzed ${Array.isArray(groupData?.tabIndices) ? groupData.tabIndices.length : 0} tabs in group.</div>
+    </div>
+  </body>
+</html>`;
+            const dataUrl = 'data:text/html;charset=utf-8,' + encodeURIComponent(htmlContent);
+            await chrome.tabs.create({ url: dataUrl });
+        } else {
+            const reason = payload?.error || 'Unknown error';
+            console.warn('AI Synthesis failed or not ready:', reason);
+        }
+    } catch (error) {
+        console.error('Synthesis failed:', error);
+    }
+}
+
+// Find AI group by existing Chrome tab group id
+function findAIGroupByChromeGroupId(groupId) {
+    if (!Array.isArray(aiGroups) || typeof groupId !== 'number') return null;
+    return aiGroups.find(g => g && g.chromeGroupId === groupId) || null;
+}
+
+// Trigger synthesis for the active Chrome tab group using tabGroups API
+async function synthesizeActiveGroupFromAction() {
+    try {
+        const [activeTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+        if (!activeTab) {
+            console.warn('No active tab for action synthesis');
+            return;
+        }
+        // Prefer using the chrome.tabGroups API to resolve the current group
+        const rawGroupId = typeof activeTab.groupId === 'number' ? activeTab.groupId : chrome.tabGroups?.TAB_GROUP_ID_NONE;
+        let targetGroup = null;
+        if (typeof rawGroupId === 'number' && rawGroupId !== chrome.tabGroups.TAB_GROUP_ID_NONE) {
+            try {
+                // Ensure group exists via tabGroups API (uses the API per requirement)
+                await chrome.tabGroups.get(rawGroupId);
+                targetGroup = findAIGroupByChromeGroupId(rawGroupId);
+            } catch (e) {
+                console.warn('tabGroups.get failed or no AI group for this Chrome group id:', e?.message || e);
+            }
+        }
+        if (!targetGroup) {
+            // Fallback: map by tab id → aiGroups membership
+            targetGroup = await findGroupByTabId(activeTab.id);
+        }
+        if (targetGroup) {
+            await createSummaryTab(targetGroup);
+        } else {
+            console.warn('No AI group associated with the active tab');
+        }
+    } catch (error) {
+        console.warn('synthesizeActiveGroupFromAction failed:', error?.message || error);
+    }
+}
+
 async function handleGroupSummaryRequest(groupIndex) {
     // Short-circuit if summarizer previously marked unavailable
     const statusData = await chrome.storage.session.get(['summarizerStatus']);
@@ -8916,6 +9405,202 @@ ${tabLines}
             error: 'Language model unavailable after retries',
             status: 'unavailable'
         };
+    })();
+}
+
+/**
+ * Εκτελείται στο MAIN world: δημιουργεί σύνθεση/αναφορά για group tabs
+ */
+function generateGroupSynthesisInPage(descriptor) {
+    function resolveLanguageModelApi() {
+        const scope = typeof self !== 'undefined' ? self : (typeof window !== 'undefined' ? window : globalThis);
+        return (
+            scope?.LanguageModel ||
+            scope?.ai?.languageModel ||
+            scope?.aiOriginTrial?.languageModel ||
+            scope?.window?.ai?.languageModel ||
+            null
+        );
+    }
+    return (async () => {
+        const scope = typeof self !== 'undefined' ? self : (typeof window !== 'undefined' ? window : globalThis);
+        const languageModelApi = resolveLanguageModelApi();
+        if (!languageModelApi) {
+            return { ok: false, error: 'Language Model API not available' };
+        }
+        const recoverablePattern = /(destroyed|closed|reset|disconnected|terminated)/i;
+        async function getSession(forceReset = false) {
+            if (forceReset) scope.__aitabLanguageSessionPromise = null;
+            if (!scope.__aitabLanguageSessionPromise) {
+                scope.__aitabLanguageSessionPromise = (async () => {
+                    if (typeof languageModelApi.availability === 'function') {
+                        try {
+                            const availability = await languageModelApi.availability();
+                            if (availability === 'unavailable') {
+                                const err = new Error('Language Model API unavailable');
+                                err.aiStatus = availability;
+                                throw err;
+                            }
+                        } catch (e) {
+                            // proceed; some implementations may not expose availability
+                        }
+                    }
+                    return await languageModelApi.create();
+                })();
+            }
+            return scope.__aitabLanguageSessionPromise;
+        }
+
+        try {
+            const centroidLine = (descriptor.centroidKeywords || []).join(', ') || 'none';
+            const tabLines = (descriptor.exemplarTabs || []).map((tab, idx) => `
+${idx + 1}. Title: ${tab.title}
+   Domain: ${tab.domain}
+   Topic: ${tab.topic || tab.primaryTopic || '—'}
+   Keywords: ${(tab.keywords || []).join(', ')}
+`).join('\n');
+            const prompt = `You are a research assistant. Analyze the following group of web pages, which represent a single research or shopping session.
+
+1. Identify the Core Subject (1-3 words).
+2. Extract 3 Key Findings/Insights from the group.
+3. If the subject is Shopping/Product Comparison, provide a brief recommendation.
+
+Return ONLY valid JSON (no extra text, no code fences) in this exact format:
+{"subject":"<Core Subject>", "summary":"<Paragraph summary (max 150 words)>", "insights":["<Insight 1>", "<Insight 2>", "<Insight 3>"]}
+
+Descriptors:
+Centroid Keywords: ${centroidLine}
+Exemplar Tabs:
+${tabLines}
+
+Rules:
+- Base your response only on the provided data.
+- Write the summary and insights in English, using a professional tone.
+- Do NOT include any explanation before or after the JSON.`.trim();
+
+            for (let attempt = 0; attempt < 2; attempt += 1) {
+                try {
+                    const session = await getSession(attempt === 1);
+                    const raw = await session.prompt(prompt);
+                    const asString = typeof raw === 'string' ? raw : String(raw);
+                    function sanitizeQuotes(s){
+                        return String(s||'')
+                            .replace(/[\u2018\u2019]/g, "'")
+                            .replace(/[\u201C\u201D]/g, '"');
+                    }
+                    function extractJsonBlock(s){
+                        const fence = s.match(/```json([\s\S]*?)```/i);
+                        if (fence) return fence[1];
+                        const start = s.indexOf('{');
+                        const end = s.lastIndexOf('}');
+                        if (start !== -1 && end !== -1 && end > start) return s.slice(start, end+1);
+                        const match = s.match(/\{[\s\S]*\}/);
+                        return match ? match[0] : s.trim();
+                    }
+                    let parsed;
+                    try {
+                        const candidate = sanitizeQuotes(extractJsonBlock(asString));
+                        parsed = JSON.parse(candidate);
+                    } catch (parseError) {
+                        // Fallback: try a minimal structure to avoid hard failure
+                        const top = (Array.isArray(descriptor.centroidKeywords) && descriptor.centroidKeywords[0])
+                            || String(descriptor.primaryTopic || descriptor.docType || 'General').slice(0, 32);
+                        const kws = (descriptor.centroidKeywords || descriptor.fallbackKeywords || []).slice(0,3);
+                        return { ok: true, subject: top, summary: `Automatic synthesis unavailable. Core focus: ${top}.`, insights: kws.length ? kws : [] };
+                    }
+                    const subject = String(parsed.subject || '').trim();
+                    const summary = String(parsed.summary || '').trim();
+                    const insights = Array.isArray(parsed.insights) ? parsed.insights.map(s => String(s || '').trim()).filter(Boolean).slice(0, 5) : [];
+                    if (!subject || !summary || insights.length === 0) {
+                        // Try to fill minimal fields instead of failing hard
+                        const top = subject || (Array.isArray(descriptor.centroidKeywords) && descriptor.centroidKeywords[0]) || 'General';
+                        const safeInsights = insights.length ? insights : (descriptor.centroidKeywords || []).slice(0,3);
+                        const safeSummary = summary || `Automatic synthesis unavailable. Core focus: ${top}.`;
+                        return { ok: true, subject: top, summary: safeSummary.slice(0,900), insights: safeInsights.slice(0,3) };
+                    }
+                    return { ok: true, subject, summary: summary.slice(0, 900), insights: insights.slice(0, 3) };
+                } catch (error) {
+                    const message = error?.message || String(error);
+                    const isRecoverable = recoverablePattern.test(message);
+                    if (isRecoverable && attempt === 0) {
+                        scope.__aitabLanguageSessionPromise = null;
+                        continue;
+                    }
+                    return { ok: false, error: message, status: error?.aiStatus || null };
+                }
+            }
+            return { ok: false, error: 'Language model unavailable after retries', status: 'unavailable' };
+        } catch (err) {
+            return { ok: false, error: err?.message || String(err) };
+        }
+    })();
+}
+
+/**
+ * In‑page AI grouping fallback: runs LM directly without relying on the content script channel
+ */
+function performAIGroupingInPage(prompt) {
+    function resolveLanguageModelApi() {
+        const scope = typeof self !== 'undefined' ? self : (typeof window !== 'undefined' ? window : globalThis);
+        return (
+            scope?.LanguageModel ||
+            scope?.ai?.languageModel ||
+            scope?.aiOriginTrial?.languageModel ||
+            scope?.window?.ai?.languageModel ||
+            null
+        );
+    }
+    return (async () => {
+        const scope = typeof self !== 'undefined' ? self : (typeof window !== 'undefined' ? window : globalThis);
+        const languageModelApi = resolveLanguageModelApi();
+        if (!languageModelApi) {
+            return { ok: false, error: 'Language Model API not available' };
+        }
+        const recoverablePattern = /(destroyed|closed|reset|disconnected|terminated)/i;
+        async function getSession(forceReset = false) {
+            if (forceReset) scope.__aitabLanguageSessionPromise = null;
+            if (!scope.__aitabLanguageSessionPromise) {
+                scope.__aitabLanguageSessionPromise = languageModelApi.create();
+            }
+            return scope.__aitabLanguageSessionPromise;
+        }
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+            try {
+                const session = await getSession(attempt === 1);
+                let raw;
+                try {
+                    raw = await session.prompt(String(prompt || '').slice(0, 6000));
+                } catch (structured) {
+                    // Retry once on structured errors
+                    raw = await session.prompt(String(prompt || ''));
+                }
+                const match = typeof raw === 'string' ? raw.match(/\{[\s\S]*\}/) : null;
+                let parsed;
+                try {
+                    parsed = match ? JSON.parse(match[0]) : JSON.parse(String(raw));
+                } catch (_) {
+                    // Fallback: return minimal result
+                    return { ok: true, result: { keywords: [] } };
+                }
+                const items = Array.isArray(parsed.keywords) ? parsed.keywords : [];
+                const normalized = items.map(it => ({
+                    index: Number(it.index),
+                    keywords: Array.isArray(it.keywords) ? it.keywords : [],
+                    shopping: it.shopping === true,
+                    shopCategory: typeof it.shopCategory === 'string' ? it.shopCategory : (typeof it.category === 'string' ? it.category : null),
+                    intent: typeof it.intent === 'string' ? it.intent : null
+                }));
+                return { ok: true, result: { keywords: normalized } };
+            } catch (error) {
+                const message = error?.message || String(error);
+                if (recoverablePattern.test(message) && attempt === 0) {
+                    scope.__aitabLanguageSessionPromise = null;
+                    continue;
+                }
+                return { ok: false, error: message };
+            }
+        }
+        return { ok: false, error: 'Language model unavailable after retries' };
     })();
 }
 
