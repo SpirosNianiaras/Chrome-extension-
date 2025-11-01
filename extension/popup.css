@@ -545,6 +545,22 @@ body {
     border-radius: 2px;
 }
 
+/* Favicon strip inside group header */
+.group-favicons {
+    display: flex;
+    gap: 4px;
+    align-items: center;
+    margin-right: auto;
+    margin-left: 10px;
+}
+.group-favicons .tab-icon {
+    width: 16px;
+    height: 16px;
+    margin-right: 0;
+    border-radius: 3px;
+    box-shadow: 0 0 0 1px rgba(0,0,0,0.08);
+}
+
 /* Improved group summary with icons */
 .group-summary::before {
     content: "ℹ️ ";

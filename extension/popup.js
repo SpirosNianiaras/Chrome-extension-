@@ -5,6 +5,7 @@
 
 // Global state
 let currentGroups = [];
+let cachedTabData = null;
 let selectedTabs = new Set();
 let isScanning = false;
 
@@ -36,35 +37,38 @@ document.addEventListener('DOMContentLoaded', () => {
     elements.exportSummaryBtn.addEventListener('click', exportSummary);
     elements.retryBtn.addEventListener('click', startScanning);
     
-    // Έλεγχος για cached data
+    // Check for cached data
     checkForCachedData();
 });
 
 /**
- * Έλεγχος για cached data από προηγούμενο scan
+ * Check for cached data from previous scan
  */
 async function checkForCachedData() {
     try {
         const result = await chrome.storage.local.get(['cachedGroups', 'tabData', 'lastScan']);
+        if (result.tabData) {
+            cachedTabData = result.tabData;
+        }
         
         if (result.cachedGroups && result.tabData && result.lastScan) {
             const timeSinceLastScan = Date.now() - result.lastScan;
             const fiveMinutes = 5 * 60 * 1000;
             
             if (timeSinceLastScan < fiveMinutes) {
-                // Εμφάνιση cached results
+                // Show cached results
                 currentGroups = result.cachedGroups;
                 showResults();
                 return;
             }
         }
         
-        // Εμφάνιση initial state
+        // Show initial state
         showInitialState();
         
     } catch (error) {
         console.error('Error checking cached data:', error);
-        // Εμφάνιση initial state με safe check
+        // Show initial state (safe check)
         if (elements.initialState) {
             showInitialState();
         }
@@ -72,7 +76,7 @@ async function checkForCachedData() {
 }
 
 /**
- * Αρχίζει τη διαδικασία σκαναρίσματος
+ * Starts the scanning process
  */
 async function startScanning() {
     if (isScanning) return;
@@ -101,14 +105,14 @@ async function startScanning() {
         
     } catch (error) {
         console.error('Scanning error:', error);
-        alert('❌ AI Tab Companion: Σφάλμα - ' + error.message);
+        alert('❌ AI Tab Companion: Error - ' + error.message);
     } finally {
         isScanning = false;
     }
 }
 
 /**
- * Ζητά πρόσβαση σε όλα τα sites ώστε το extension να μπορεί να διαβάσει τα tabs
+ * Requests access to all sites so the extension can read tabs
  */
 function requestAllHostPermissions() {
     return new Promise((resolve) => {
@@ -139,10 +143,10 @@ function requestAllHostPermissions() {
 }
 
 /**
- * Περιμένει τα αποτελέσματα από το background script
+ * Waits for results from the background script
  */
 async function waitForResults() {
-    const maxWaitTime = 240000; // 240 seconds (4 λεπτά) για την πρώτη εκτέλεση/μοντέλο
+    const maxWaitTime = 240000; // 240 seconds (first run/model may take longer)
     const checkInterval = 1000; // 1 second
     let elapsed = 0;
     
@@ -151,7 +155,7 @@ async function waitForResults() {
             const result = await chrome.storage.local.get(['cachedGroups', 'tabData', 'lastScan', 'aiError', 'error']);
             
             if (result.aiError) {
-                throw new Error(result.error || 'Chrome AI δεν είναι διαθέσιμο');
+                throw new Error(result.error || 'Chrome AI is not available');
             }
             
             if (result.cachedGroups && result.tabData) {
@@ -161,11 +165,11 @@ async function waitForResults() {
             }
             
             if (elapsed === 30000) {
-                showTemporaryMessage('⏳ Η πρώτη AI ανάλυση μπορεί να πάρει 2-4 λεπτά καθώς κατεβαίνει το μοντέλο. Περιμένουμε αποτελέσματα...');
+                showTemporaryMessage('⏳ The first AI analysis may take 2–4 minutes as the model downloads. Waiting for results...');
             }
             
             if (elapsed === 120000) {
-                showTemporaryMessage('⏳ Ακόμα αναλύουμε... Η πρώτη φορά μπορεί να πάρει έως 4 λεπτά. Περιμένουμε...');
+                showTemporaryMessage('⏳ Still analyzing... The first run may take up to 4 minutes. Please wait...');
             }
             
             await new Promise(resolve => setTimeout(resolve, checkInterval));
@@ -181,7 +185,7 @@ async function waitForResults() {
 }
 
 /**
- * Εμφάνιση loading state
+ * Show loading state
  */
 function showLoading() {
     hideAllStates();
@@ -189,7 +193,7 @@ function showLoading() {
 }
 
 /**
- * Εμφάνιση initial state
+ * Show initial state
  */
 function showInitialState() {
     hideAllStates();
@@ -197,7 +201,7 @@ function showInitialState() {
 }
 
 /**
- * Εμφάνιση results με alert
+ * Show results with alert
  */
 function showResultsWithAlert() {
     let message = '🎉 AI Tab Companion: Analysis Complete!\n\n';
@@ -219,17 +223,17 @@ function showResultsWithAlert() {
         message += '❌ No tab groups found';
     }
     
-    // Εμφάνιση αποτελεσμάτων και μετά επιλογές για κλείσιμο
+    // Show results and then grouping options
     alert(message);
     
-    // Μετά το OK, εμφάνιση επιλογών για ομαδοποίηση
+    // After OK, show options for grouping
     if (currentGroups && currentGroups.length > 0) {
         showGroupingOptions();
     }
 }
 
 /**
- * Εμφάνιση επιλογών για ομαδοποίηση tabs
+ * Show options for tab grouping
  */
 async function showGroupingOptions() {
     if (!currentGroups || currentGroups.length === 0) return;
@@ -249,17 +253,17 @@ async function showGroupingOptions() {
 }
 
 /**
- * Δημιουργεί ομάδες tabs με AI intelligent grouping
+ * Creates tab groups with AI intelligent grouping
  */
 async function createTabGroups(groups) {
     try {
-        // Λήψη tab data
+        // Get tab data
         const result = await chrome.storage.local.get(['tabData']);
         if (!result.tabData) {
             throw new Error('Tab data not found');
         }
         
-        // Βρες ομάδες με περισσότερα από 1 tab
+        // Find groups with more than 1 tab
         const groupsWithMultipleTabs = groups.filter(group => group.tabIndices.length > 1);
         
         if (groupsWithMultipleTabs.length === 0) {
@@ -271,14 +275,14 @@ async function createTabGroups(groups) {
         let createdGroups = [];
         
         for (const group of groupsWithMultipleTabs) {
-            // Δημιουργία ομάδας για tabs με περισσότερα από 1 tab
+            // Create a group for tabs with more than 1 tab
             const tabIds = group.tabIndices.map(index => result.tabData[index].id);
             
             if (tabIds.length > 0) {
-                // Δημιουργία ομάδας με το Chrome API
+                // Create group via Chrome API
                 const groupId = await chrome.tabs.group({ tabIds: tabIds });
                 
-                // Ονομασία της ομάδας με το AI-generated topic
+                // Name the group using the AI-generated topic
                 await chrome.tabGroups.update(groupId, { 
                     title: group.name,
                     color: getRandomColor()
@@ -289,7 +293,7 @@ async function createTabGroups(groups) {
             }
         }
         
-        // Εμφάνιση αποτελέσματος
+        // Show result
         let resultMessage = `✅ AI Tab Companion: Created ${createdGroups.length} groups!\n\n`;
         resultMessage += 'Grouped tabs with similar content:\n';
         createdGroups.forEach(groupName => {
@@ -301,12 +305,12 @@ async function createTabGroups(groups) {
         
     } catch (error) {
         console.error('Error creating tab groups:', error);
-        alert('❌ AI Tab Companion: Σφάλμα κατά τη δημιουργία ομάδων - ' + error.message);
+        alert('❌ AI Tab Companion: Error while creating groups - ' + error.message);
     }
 }
 
 /**
- * Βρίσκει ομάδες tabs που είναι δίπλα-δίπλα
+ * Finds adjacent tab groups
  */
 function findAdjacentTabGroups(allTabs) {
     const groups = [];
@@ -317,11 +321,11 @@ function findAdjacentTabGroups(allTabs) {
         const tab = allTabs[i];
         const domain = new URL(tab.url).hostname;
         
-        // Αν είναι το ίδιο domain με το προηγούμενο tab
+        // If same domain as previous tab
         if (domain === currentDomain) {
             currentGroup.push(tab.id);
         } else {
-            // Αν έχουμε ομάδα με περισσότερα από 1 tab, την προσθέτουμε
+            // If we have a group with more than 1 tab, add it
             if (currentGroup.length > 1) {
                 groups.push({
                     tabIds: [...currentGroup],
@@ -330,13 +334,13 @@ function findAdjacentTabGroups(allTabs) {
                 });
             }
             
-            // Αρχίζουμε νέα ομάδα
+            // Start a new group
             currentGroup = [tab.id];
             currentDomain = domain;
         }
     }
     
-    // Προσθέτουμε την τελευταία ομάδα αν έχει περισσότερα από 1 tab
+    // Add the last group if it has more than 1 tab
     if (currentGroup.length > 1) {
         groups.push({
             tabIds: [...currentGroup],
@@ -349,7 +353,7 @@ function findAdjacentTabGroups(allTabs) {
 }
 
 /**
- * Επιστρέφει τυχαίο χρώμα για τις ομάδες
+ * Returns a random color for groups
  */
 function getRandomColor() {
     const colors = ['red', 'orange', 'yellow', 'green', 'blue', 'purple', 'pink', 'grey'];
@@ -357,12 +361,16 @@ function getRandomColor() {
 }
 
 /**
- * Εμφάνιση results (legacy)
+ * Show results (legacy)
  */
-function showResults() {
+async function showResults() {
     hideAllStates();
     elements.results.classList.remove('hidden');
-    
+    // Ensure tab data is available
+    if (!cachedTabData) {
+        const res = await chrome.storage.local.get(['tabData']);
+        cachedTabData = res.tabData || null;
+    }
     // Render groups
     renderGroups();
     
@@ -371,7 +379,7 @@ function showResults() {
 }
 
 /**
- * Εμφάνιση error state
+ * Show error state
  */
 function showError(message) {
     hideAllStates();
@@ -380,7 +388,7 @@ function showError(message) {
 }
 
 /**
- * Απόκρυψη όλων των states
+ * Hide all states
  */
 function hideAllStates() {
     if (elements.loading) elements.loading.classList.add('hidden');
@@ -390,7 +398,7 @@ function hideAllStates() {
 }
 
 /**
- * Render των groups στο UI
+ * Render groups in the UI
  */
 function renderGroups() {
     elements.groupsContainer.innerHTML = '';
@@ -407,7 +415,7 @@ function renderGroups() {
 }
 
 /**
- * Δημιουργία element για μια group
+ * Create element for a group
  */
 function createGroupElement(group, groupIndex) {
     const groupDiv = document.createElement('div');
@@ -421,6 +429,37 @@ function createGroupElement(group, groupIndex) {
         <h3 class="group-title">${group.name}</h3>
         <span class="group-count">${group.tabIndices.length}</span>
     `;
+    // Small favicon strip for the group (unique favicons up to 6)
+    try {
+        if (Array.isArray(group.tabIndices) && group.tabIndices.length && cachedTabData) {
+            const favSet = new Set();
+            const favs = [];
+            for (const idx of group.tabIndices) {
+                const t = cachedTabData[idx];
+                const src = t?.favicon || t?.favIconUrl || '';
+                if (src && !favSet.has(src)) {
+                    favSet.add(src);
+                    favs.push(src);
+                    if (favs.length >= 6) break;
+                }
+            }
+            if (favs.length) {
+                const strip = document.createElement('div');
+                strip.className = 'group-favicons';
+                favs.forEach(src => {
+                    const img = document.createElement('img');
+                    img.className = 'tab-icon';
+                    img.src = src;
+                    img.referrerPolicy = 'no-referrer';
+                    img.loading = 'lazy';
+                    img.onerror = () => { img.src = 'icons/icon16.png'; };
+                    strip.appendChild(img);
+                });
+                // Insert strip into header (before count badge)
+                header.insertBefore(strip, header.lastElementChild);
+            }
+        }
+    } catch (_) {}
     
     // Group content
     const content = document.createElement('div');
@@ -440,7 +479,7 @@ function createGroupElement(group, groupIndex) {
     } else if (group.summaryPending) {
         const summaryDiv = document.createElement('div');
         summaryDiv.className = 'group-summary pending';
-        summaryDiv.innerHTML = `<p class="summary-placeholder">🧠 Πάτησε για να δημιουργηθεί AI περίληψη.</p>`;
+        summaryDiv.innerHTML = `<p class="summary-placeholder">🧠 Click to generate AI summary.</p>`;
         content.appendChild(summaryDiv);
     }
     
@@ -465,7 +504,7 @@ function createGroupElement(group, groupIndex) {
 }
 
 /**
- * Δημιουργία element για ένα tab
+ * Create element for a tab
  */
 function createTabItem(tabIndex) {
     const li = document.createElement('li');
@@ -477,22 +516,40 @@ function createTabItem(tabIndex) {
     checkbox.className = 'tab-checkbox';
     checkbox.dataset.tabIndex = tabIndex;
     
+    // Optional favicon
+    const icon = document.createElement('img');
+    icon.className = 'tab-icon';
+    icon.src = 'icons/icon16.png';
+    icon.referrerPolicy = 'no-referrer';
     // Tab info
     const tabInfo = document.createElement('div');
     tabInfo.className = 'tab-info';
     
-    // Θα χρειαστούμε τα tab data από το storage
-    chrome.storage.local.get(['tabData']).then(result => {
-        if (result.tabData && result.tabData[tabIndex]) {
-            const tab = result.tabData[tabIndex];
-            tabInfo.innerHTML = `
-                <div class="tab-title">${tab.title}</div>
-                <div class="tab-url">${tab.url}</div>
-            `;
+    // We will need the tab data from storage
+    const applyTabData = (tab) => {
+        if (!tab) return;
+        tabInfo.innerHTML = `
+            <div class="tab-title">${tab.title}</div>
+            <div class="tab-url">${tab.url}</div>
+        `;
+        if (tab.favicon || tab.favIconUrl) {
+            icon.src = tab.favicon || tab.favIconUrl;
         }
-    });
+        icon.onerror = () => { icon.src = 'icons/icon16.png'; };
+    };
+    if (cachedTabData && cachedTabData[tabIndex]) {
+        applyTabData(cachedTabData[tabIndex]);
+    } else {
+        chrome.storage.local.get(['tabData']).then(result => {
+            const tab = result.tabData && result.tabData[tabIndex];
+            if (tab) {
+                applyTabData(tab);
+                cachedTabData = result.tabData;
+            }
+        });
+    }
     
-    // Event listener για checkbox
+    // Event listener for checkbox
     checkbox.addEventListener('change', (e) => {
         if (e.target.checked) {
             selectedTabs.add(tabIndex);
@@ -503,6 +560,7 @@ function createTabItem(tabIndex) {
     });
     
     li.appendChild(checkbox);
+    li.appendChild(icon);
     li.appendChild(tabInfo);
     
     return li;
@@ -535,7 +593,7 @@ async function requestGroupSummary(groupIndex, contentElement) {
     }
     
     summaryDiv.classList.remove('pending');
-    summaryDiv.innerHTML = `<p class="summary-placeholder">🧠 Δημιουργία AI περίληψης...</p>`;
+    summaryDiv.innerHTML = `<p class="summary-placeholder">🧠 Generating AI summary...</p>`;
     
     try {
         const response = await chrome.runtime.sendMessage({ type: 'REQUEST_GROUP_SUMMARY', groupIndex });
@@ -559,27 +617,27 @@ async function requestGroupSummary(groupIndex, contentElement) {
 }
 
 /**
- * Ενημέρωση state του close button
+ * Update state of the close button
  */
 function updateCloseButtonState() {
     const hasSelection = selectedTabs.size > 0;
     elements.closeSelectedBtn.disabled = !hasSelection;
     
     if (hasSelection) {
-        elements.closeSelectedBtn.textContent = `🗑️ Κλείσε Επιλεγμένα (${selectedTabs.size})`;
+        elements.closeSelectedBtn.textContent = `🗑️ Close Selected (${selectedTabs.size})`;
     } else {
-        elements.closeSelectedBtn.textContent = '🗑️ Κλείσε Επιλεγμένα';
+        elements.closeSelectedBtn.textContent = '🗑️ Close Selected';
     }
 }
 
 /**
- * Κλείνει τα επιλεγμένα tabs
+ * Closes selected tabs
  */
 async function closeSelectedTabs() {
     if (selectedTabs.size === 0) return;
     
     try {
-        // Λήψη tab data για να βρούμε τα IDs
+        // Get tab data to find IDs
         const result = await chrome.storage.local.get(['tabData']);
         if (!result.tabData) {
             throw new Error('Tab data not found');
@@ -587,19 +645,19 @@ async function closeSelectedTabs() {
         
         const tabIds = Array.from(selectedTabs).map(index => result.tabData[index].id);
         
-        // Αποστολή μηνύματος στο background script
+        // Send message to background script
         const response = await sendMessageToBackground('CLOSE_SELECTED_TABS', { tabIds });
         
         if (response.success) {
-            // Ενημέρωση UI
+            // Update UI
             selectedTabs.clear();
             updateCloseButtonState();
             
-            // Ενημέρωση groups (αφαίρεση κλεισμένων tabs)
+            // Update groups (remove closed tabs)
             updateGroupsAfterClosing(tabIds);
             
-            // Εμφάνιση success message
-            showTemporaryMessage(response.message || 'Tabs κλείστηκαν επιτυχώς');
+            // Show success message
+            showTemporaryMessage(response.message || 'Tabs closed successfully');
             
         } else {
             throw new Error(response.error || 'Failed to close tabs');
@@ -607,15 +665,15 @@ async function closeSelectedTabs() {
         
     } catch (error) {
         console.error('Error closing tabs:', error);
-        showTemporaryMessage(`Σφάλμα: ${error.message}`);
+        showTemporaryMessage(`Error: ${error.message}`);
     }
 }
 
 /**
- * Ενημέρωση groups μετά το κλείσιμο tabs
+ * Update groups after closing tabs
  */
 function updateGroupsAfterClosing(closedTabIds) {
-    // Αφαίρεση κλεισμένων tabs από τα groups
+    // Remove closed tabs from groups
     currentGroups.forEach(group => {
         group.tabIndices = group.tabIndices.filter(index => {
             const result = chrome.storage.local.get(['tabData']).then(data => {
@@ -628,7 +686,7 @@ function updateGroupsAfterClosing(closedTabIds) {
         });
     });
     
-    // Αφαίρεση κενών groups
+    // Remove empty groups
     currentGroups = currentGroups.filter(group => group.tabIndices.length > 0);
     
     // Re-render
@@ -636,29 +694,29 @@ function updateGroupsAfterClosing(closedTabIds) {
 }
 
 /**
- * Εξάγει περίληψη των αποτελεσμάτων
+ * Export results summary
  */
 async function exportSummary() {
     try {
         const response = await sendMessageToBackground('EXPORT_SUMMARY');
         
         if (response.success) {
-            showTemporaryMessage(response.message || 'Η περίληψη εξήχθη επιτυχώς');
+            showTemporaryMessage(response.message || 'Summary exported successfully');
         } else {
             throw new Error(response.error || 'Failed to export summary');
         }
         
     } catch (error) {
         console.error('Error exporting summary:', error);
-        showTemporaryMessage(`Σφάλμα: ${error.message}`);
+        showTemporaryMessage(`Error: ${error.message}`);
     }
 }
 
 /**
- * Εμφάνιση προσωρινό μήνυμα
+ * Show temporary message
  */
 function showTemporaryMessage(message) {
-    // Δημιουργία temporary message element
+    // Create temporary message element
     const messageDiv = document.createElement('div');
     messageDiv.className = 'temporary-message';
     messageDiv.textContent = message;
@@ -678,7 +736,7 @@ function showTemporaryMessage(message) {
     
     document.body.appendChild(messageDiv);
     
-    // Αφαίρεση μετά από 3 δευτερόλεπτα
+    // Remove after 3 seconds
     setTimeout(() => {
         if (messageDiv.parentNode) {
             messageDiv.parentNode.removeChild(messageDiv);

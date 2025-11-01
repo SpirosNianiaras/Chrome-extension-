@@ -219,7 +219,7 @@ async function getLanguageModelSession() {
                     throw new Error('Language Model API is unavailable on this device');
                 }
                 if ((availability === 'downloadable' || availability === 'downloading') && !(navigator.userActivation && navigator.userActivation.isActive)) {
-                    throw new Error('Language Model requires user activation to download. Κάνε κλικ στη σελίδα και δοκίμασε ξανά.');
+                    throw new Error('Language Model requires user activation to download. Click the page and try again.');
                 }
             } catch (availabilityError) {
                 console.warn('Content script: LanguageModel.availability() failed, continuing optimistically:', availabilityError);
@@ -294,10 +294,19 @@ async function performAIGrouping(prompt) {
             // Μετατροπή σε σωστό format για το background script
             // Support optional shopping flag per item if provided by the model
             const items = Array.isArray(parsed.keywords) ? parsed.keywords : [];
+            const allowedCats = new Set(['fashion','electronics','groceries','home','beauty','sports','automotive','digital','general']);
+            const normCat = (v) => {
+                const s = String(v ?? '').toLowerCase().trim();
+                return allowedCats.has(s) ? s : null;
+            };
             const normalized = items.map(it => ({
                 index: it.index,
                 keywords: Array.isArray(it.keywords) ? it.keywords : [],
-                shopping: it.shopping === true
+                shopping: it.shopping === true,
+                shopCategory: normCat(it.shopCategory ?? it.category ?? it.type),
+                intent: (typeof it.intent === 'string' && it.intent.trim())
+                    ? it.intent.trim().toLowerCase().slice(0, 40)
+                    : null
             }));
             const result = { keywords: normalized };
             
@@ -326,7 +335,7 @@ function buildHeuristicKeywordsFromPrompt(prompt) {
         const result = { keywords: [] };
         const lines = String(prompt).split('\n');
         const startIdx = lines.findIndex(l => l.trim() === 'Tabs:');
-        const stopwords = new Set(['the','and','for','with','from','your','site','home','official','news','blog','about','page','week','google','openai','ai','www','com','net','org','https','http','document','recently','published']);
+        const stopwords = new Set(['the','and','for','with','from','your','site','home','official','news','blog','about','page','week','google','openai','ai','www','com','net','org','https','http','document','recently','published','update','updates','info','general']);
         if (startIdx >= 0) {
             for (let i = startIdx + 1; i < lines.length; i++) {
                 const line = lines[i];
@@ -340,8 +349,12 @@ function buildHeuristicKeywordsFromPrompt(prompt) {
                 const tokens = raw.split(/[^a-z0-9α-ωάέίήόύώ]+/i)
                     .filter(t => t && t.length > 2 && !stopwords.has(t));
                 const picked = [];
-                for (const t of tokens) { if (!picked.includes(t)) picked.push(t); if (picked.length >= 4) break; }
-                result.keywords.push({ index, keywords: picked.slice(0, 3) });
+                for (const t of tokens) {
+                    if (!picked.includes(t)) picked.push(t);
+                    if (picked.length >= 10) break; // gather more to allow 8 unique after filtering downstream
+                }
+                // Return up to 8 distinct keywords per tab
+                result.keywords.push({ index, keywords: picked.slice(0, 8) });
             }
         }
         console.log('🤖 [AI Keywords] Heuristic keywords built:', result.keywords.length);
@@ -378,7 +391,7 @@ async function performAISummarization(groupContent) {
                 }
                 
                 if ((availability === 'downloadable' || availability === 'downloading') && !(navigator.userActivation && navigator.userActivation.isActive)) {
-                    throw new Error('Summarizer requires user activation to download. Κάνε κλικ στη σελίδα και δοκίμασε ξανά.');
+                    throw new Error('Summarizer requires user activation to download. Click the page and try again.');
                 }
             } catch (availabilityError) {
                 console.warn('Content script: Summarizer.availability() failed, continuing optimistically:', availabilityError);

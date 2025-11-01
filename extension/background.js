@@ -176,7 +176,7 @@ const TFIDF_TOKEN_LIMIT = 24;
 const LABEL_CACHE_TTL = 60 * 60 * 1000; // 1 hour
 const MAX_AI_FEATURE_TABS = 16;  // Allow AI (incl. summarizer) on up to 16 tabs
 const MAX_AI_EMBED_TABS = 16;   // Allow embeddings generation on up to 16 tabs
-const MAX_AI_LABEL_GROUPS = 6; // Allow AI to generate up to 6 group titles
+const MAX_AI_LABEL_GROUPS = 6; // Allow full labels for up to 6 groups initially
 const PAIRWISE_LLM_CACHE = new Map();
 const RESTRICTED_HOSTS = [
     'mail.google.com',
@@ -206,7 +206,8 @@ const TAXONOMY_RULES = [
     { match: /wikipedia\.org/i, tags: ['reference', 'encyclopedia'] },
     { match: /github\.com/i, tags: ['software', 'development', 'github'] },
     { match: /stackoverflow\.com/i, tags: ['software', 'programming', 'questions'] },
-    { match: /futbin\.com|fut\.gg|ea\.com\/fc|fifa/i, tags: ['gaming', 'fifa ultimate team'] },
+    // Generalize gaming taxonomy; avoid brand-specific tags
+    { match: /futbin\.com|fut\.gg|ea\.com\/fc|fifa/i, tags: ['gaming'] },
     { match: /nature\.com/i, tags: ['medical research', 'science', 'journal'] },
     { match: /nejm\.org/i, tags: ['medical research', 'clinical medicine', 'journal'] },
     { match: /pubmed\.ncbi\.nlm\.nih\.gov|nih\.gov|medscape/i, tags: ['medical research', 'healthcare'] },
@@ -218,8 +219,20 @@ const TAXONOMY_RULES = [
 
 const HAS_PERFORMANCE_API = typeof performance !== 'undefined' && typeof performance.now === 'function';
 const AI_FEATURE_TIMEOUT = 18000;
-const AI_LABEL_TIMEOUT = 15000;
+// Increase label timeout to reduce spurious timeouts on first load
+const AI_LABEL_TIMEOUT = 22000;
 const AI_SUMMARY_TIMEOUT = 16000;
+// Adaptive cooldowns for labeling
+const AI_LABEL_COOLDOWN_SUCCESS_MS = 600;
+const AI_LABEL_COOLDOWN_FAILURE_MS = 1400;
+
+// ---- RAM management knobs ----
+const RAM_CLEANUP_ENABLED = true;                 // Enable post-run RAM cleanup
+const RAM_CLEANUP_DELAY_MS = 2000;                // Delay before cleanup to avoid UI jank
+const RAM_PRUNE_CONTENT = true;                   // Strip heavy content strings from unused tabs in memory
+const RAM_DISCARD_UNUSED_TABS = true;             // Ask Chrome to discard unused tabs (not active/pinned/audible)
+const RAM_MAX_DISCARDS_PER_RUN = 5;               // Safety cap
+const RAM_MIN_TAB_AGE_MS = 30 * 1000;             // Only discard tabs older than 30s (avoid flicker on fresh tabs)
 function nowMs() {
     return HAS_PERFORMANCE_API ? performance.now() : Date.now();
 }
@@ -228,19 +241,111 @@ function nowMs() {
 function detectShoppingStrong(text = '', url = '') {
     try {
         const s = `${String(text || '')} ${String(url || '')}`.toLowerCase();
+        const u = String(url || '').toLowerCase();
+        let host = '';
+        let path = '';
+        try { const uo = new URL(url); host = (uo.hostname || '').toLowerCase(); path = (uo.pathname || '').toLowerCase(); } catch {}
+
+        // Domain heuristics: common e-commerce hosts
+        const ECOMM_HOSTS = /(amazon\.|ebay\.|bestbuy\.|target\.|temu\.|aliexpress\.|shein\.|walmart\.|etsy\.|flipkart\.|skroutz\.|public\.gr|plaisio\.)/;
+        const onEcommHost = ECOMM_HOSTS.test(host);
+        const ecommPath = /(\/s\?|\/search(?![a-z])|\/search_result|\/sch\/|\/pdsearch\/|\/dp\/|\/gp\/|\/product|\/cart|\/checkout|\/c\/|\/category|\/browse|abcat\d|cid\d?)/.test(path)
+            || /[?&](_?nkw|k|q|query|search|search_term|searchterm|searchtype|search_type|search_source|keyword|keywords|searchTerm|searchTermRaw)=/i.test(u)
+            || (onEcommHost && /[?&][^=]*search[^=]*=/i.test(u));
+
         const hasCart = /(add to cart|add-to-cart|\bcart\b|checkout|buy now|buy)/.test(s);
         const hasFulfillment = /(free shipping|delivery|\bin stock\b|returns?)/.test(s);
         const hasCurrency = /[\$€£]\s?\d/.test(s) || /(usd|eur|gbp)\s?\d/.test(s);
         const hasPriceWord = /\bprice\b|\bprices\b/.test(s);
+        const hasDealWord = /(\bsale\b|\bdeals?\b|\bdiscount\b|\boffers?\b)/.test(s);
         const hasListingControls = /\bfilters?\b|\bsort\b|\brefine\b|\bapply filter\b/.test(s);
         const hasGreekCommerce = /(καλάθι|ταμείο|αγορά|προσφορά|έκπτωση|εκπτωση|τιμή)/.test(s);
-        // Strong if: direct commerce actions OR fulfillment signals OR currency present
+
+        // Strong signals
         if (hasCart || hasFulfillment || hasCurrency || hasGreekCommerce) return true;
-        // Otherwise require combination of price and listing controls to avoid false positives
+        // Domain+path heuristic counts as shopping even if content string is sparse
+        if (onEcommHost && (ecommPath || hasDealWord || hasPriceWord || hasListingControls)) return true;
+        // If on e-comm host and title hints at product/category, consider shopping
+        if (onEcommHost && /(category|search|results|shop|store|sale|deals?)/.test(s)) return true;
+        // Otherwise require combination of price and listing controls
         if (hasPriceWord && hasListingControls) return true;
         return false;
     } catch (_) {
         return false;
+    }
+}
+
+// Infer a shopping subcategory when AI does not provide one
+function inferShopCategoryFromSignals(title = '', url = '', keywords = []) {
+    try {
+        const t = String(title || '').toLowerCase();
+        const u = String(url || '').toLowerCase();
+        let host = '';
+        try { host = new URL(url).hostname.replace(/^www\./,'').toLowerCase(); } catch {}
+        const kw = Array.isArray(keywords) ? keywords.map(k => String(k||'').toLowerCase()) : [];
+        const s = `${t} ${kw.join(' ')} ${host} ${u}`;
+
+        const hasAny = (re) => re.test(s);
+
+        // Fashion
+        if (hasAny(/\b(dress|dresses|clothing|apparel|skirt|jeans|pants|shirt|top|hoodie|sneakers|heels|boots|fashion)\b|\bshein\b|\basos\b|\bzara\b|\bhm\b/)) {
+            return 'fashion';
+        }
+        // Electronics / Gaming devices & accessories
+        if (hasAny(/\b(pc|laptop|keyboard|mouse|headset|monitor|console|tv|camera|tablet|iphone|android|gpu|cpu|ssd|electronics|gaming accessories?)\b|\bbestbuy\b|\bnewegg\b|\bmicrocenter\b/)) {
+            return 'electronics';
+        }
+        // Home & furniture
+        if (hasAny(/\b(furniture|chair|sofa|table|desk|bed|mattress|kitchen|cookware|decor|lamp|lighting|rug|vacuum|home)\b/)) {
+            return 'home';
+        }
+        // Groceries
+        if (hasAny(/\b(grocery|groceries|supermarket|food|snack|beverage|drink)\b/)) {
+            return 'groceries';
+        }
+        // Beauty
+        if (hasAny(/\b(makeup|skincare|cosmetics|fragrance|perfume|beauty|haircare|lotion|serum)\b/)) {
+            return 'beauty';
+        }
+        // Sports (sporting goods, not video gaming)
+        if (hasAny(/\b(treadmill|dumbbell|fitness|gym|jersey|bike|bicycle|helmet|sport(s)?|soccer|basketball|tennis|yoga|golf)\b/)) {
+            return 'sports';
+        }
+        // Automotive
+        if (hasAny(/\b(automotive|car|auto|tire|tires|brake|engine|oil|wiper|battery|spark plug)\b/)) {
+            return 'automotive';
+        }
+        // Digital goods
+        if (hasAny(/\b(software|license|ebook|course|download|subscription|gift\s?card|digital)\b/)) {
+            return 'digital';
+        }
+        return 'general';
+    } catch (_) {
+        return null;
+    }
+}
+
+// Infer shopping intent (short product/category term) from URL/title when AI omits it
+function inferShoppingIntentFromUrl(url = '', title = '') {
+    try {
+        const u = new URL(String(url || ''));
+        const params = u.searchParams;
+        const fields = ['q','query','search','search_key','searchTerm','searchTermRaw','keyword','k','_nkw'];
+        for (const f of fields) {
+            const v = params.get(f);
+            if (v && v.trim()) return String(v).toLowerCase().trim().split(/[^a-z0-9]+/i)[0] || null;
+        }
+        const p = u.pathname.toLowerCase();
+        // Common path patterns, e.g. /pdsearch/dresses, /search/dresses
+        const m = p.match(/\/(pdsearch|search|search_result)\/([^\/?#]+)/);
+        if (m && m[2]) return decodeURIComponent(m[2]).toLowerCase().trim().split(/[^a-z0-9]+/i)[0] || null;
+        // Fallback quick pick from title if it looks like a simple query
+        const t = String(title || '').toLowerCase();
+        const tt = t.match(/\b(dress|dresses|laptop|laptops|monitor|chair|shoes|sneakers|hoodie|keyboard|mouse)\b/);
+        if (tt && tt[0]) return tt[0];
+        return null;
+    } catch (_) {
+        return null;
     }
 }
 
@@ -255,6 +360,9 @@ function logTiming(label, startTime) {
 
 let deferredSummaryTimer = null;
 let deferredSummaryInProgress = false;
+let deferredLabelTimer = null;
+let deferredLabelInProgress = false;
+let labelingActive = false; // gate to avoid LM contention with summarizer
 const groupActivityState = new Map();
 let autoSuspendTimer = null;
 
@@ -726,7 +834,7 @@ async function ensureHostPermissionsForTabs(tabs) {
         
     } catch (error) {
         console.error('Failed to verify/request host permissions:', error);
-        throw new Error(`Αποτυχία ελέγχου δικαιωμάτων: ${error.message}`);
+        throw new Error(`Permission check failed: ${error.message}`);
     }
 }
 
@@ -816,7 +924,7 @@ async function handleScanTabs(sendResponse) {
         if (validTabs.length === 0) {
             sendResponse({ 
                 success: false, 
-                error: 'Δεν βρέθηκαν έγκυρα tabs για ανάλυση' 
+                error: 'No valid tabs found for analysis' 
             });
             isScanning = false;
             return;
@@ -832,7 +940,7 @@ async function handleScanTabs(sendResponse) {
             isScanning = false;
             sendResponse({
                 success: false,
-                error: 'Απαιτούνται δικαιώματα πρόσβασης για όλα τα sites. Επιτρέψτε την πρόσβαση στα tabs και δοκιμάστε ξανά.'
+                error: 'Host permissions for all sites are required. Please grant access to tabs and try again.'
             });
             return;
         }
@@ -982,7 +1090,8 @@ async function handleScanTabs(sendResponse) {
                         cachedGroups: aiGroups,
                         tabData: currentTabData
                     });
-                    scheduleDeferredSummaries(200);
+                    scheduleDeferredLabels(200);
+                    scheduleDeferredSummaries(800);
                 }
             }
         } catch (reuseError) {
@@ -995,33 +1104,31 @@ async function handleScanTabs(sendResponse) {
             
             if (cachedResult[cacheKey] && (Date.now() - cachedResult[cacheKey].timestamp) < 300000) { // 5 minutes cache
                 console.log('CACHE DISABLED - forcing fresh AI analysis');
-                // aiGroups = cachedResult[cacheKey].groups;
-                // currentTabData = cachedResult[cacheKey].tabData;
-                // scheduleDeferredSummaries(200);
-            } else {
-                try {
-                    await performAIAnalysis();
-                    console.log('AI analysis completed successfully');
-                    
-                    await chrome.storage.local.set({
-                        [cacheKey]: {
-                            groups: aiGroups,
-                            tabData: currentTabData,
-                            timestamp: Date.now()
-                        }
-                    });
-                    console.log('AI analysis results cached');
-                } catch (aiError) {
-                    console.error('AI analysis failed:', aiError);
-                    isScanning = false;
-                    // Αποθήκευση error στο storage για να το δει το popup
-                    await chrome.storage.local.set({
-                        aiError: true,
-                        error: `AI ανάλυση απέτυχε: ${aiError.message}`,
-                        lastScan: Date.now()
-                    });
-                    return;
-                }
+                // Intentionally ignoring cached result; proceed to fresh analysis below
+            }
+
+            try {
+                await performAIAnalysis();
+                console.log('AI analysis completed successfully');
+                
+                await chrome.storage.local.set({
+                    [cacheKey]: {
+                        groups: aiGroups,
+                        tabData: currentTabData,
+                        timestamp: Date.now()
+                    }
+                });
+                console.log('AI analysis results cached');
+            } catch (aiError) {
+                console.error('AI analysis failed:', aiError);
+                isScanning = false;
+                // Αποθήκευση error στο storage για να το δει το popup
+                await chrome.storage.local.set({
+                    aiError: true,
+                    error: `AI analysis failed: ${aiError.message}`,
+                    lastScan: Date.now()
+                });
+                return;
             }
         }
         
@@ -1059,7 +1166,7 @@ async function handleScanTabs(sendResponse) {
                 
                 sendResponse({ 
                     success: true, 
-                    message: `Ομαδοποίηση ολοκληρώθηκε με ${currentTabData.length} tabs (ορισμένα tabs δεν μπόρεσαν να εξαχθούν)`,
+                    message: `Grouping completed with ${currentTabData.length} tabs (some tabs could not be extracted)`,
                     groups: aiGroups.length,
                     tabs: currentTabData.length
                 });
@@ -1072,7 +1179,7 @@ async function handleScanTabs(sendResponse) {
         
         sendResponse({ 
             success: false, 
-            error: `Σφάλμα κατά το σκάναρισμα: ${error.message}` 
+            error: `Scanning error: ${error.message}` 
         });
         logTiming('Full scan pipeline (errored)', scanStart);
     }
@@ -1616,7 +1723,7 @@ function shouldMergeProvisional(taxonomy1, tokens1, taxonomy2, tokens2) {
     // - BOTH sides must carry gaming tokens to avoid pulling unrelated general tabs
     // - If either side has shopping tokens, do NOT merge under gaming
     if ((taxonomy1.final === 'gaming' && taxonomy2.final === 'general') || (taxonomy2.final === 'gaming' && taxonomy1.final === 'general')) {
-        const gamingTokens = new Set(['gaming', 'game', 'players', 'squad']);
+        const gamingTokens = new Set(['gaming', 'game', 'players', 'squad', 'ultimate', 'fut', 'fifa', 'ea', 'fc']);
         const shoppingTokens = new Set(['buy','shop','price','sale','deal','cart','checkout']);
         const t1 = new Set(tokens1.tokens);
         const t2 = new Set(tokens2.tokens);
@@ -2021,10 +2128,10 @@ async function performAIEnsembleFusion(deterministicGroups, tabDataForAI) {
     // Adaptive thresholds per category
     const ADAPTIVE_THRESHOLDS = {
         medical: 0.18,    // Lower for medical (strong domain similarities)
-        technology: 0.20, // Lower for AI/tech content
-        gaming: 0.25,     // Medium for gaming
-        news: 0.30,       // Higher for news (avoid over-merge)
-        general: 0.25     // Default
+        technology: 0.28, // Slightly higher to reduce cross-topic merges
+        gaming: 0.40,     // Higher for gaming to avoid pulling general/shopping
+        news: 0.38,       // Higher for news (avoid over-merge)
+        general: 0.36     // Raised to avoid general↔topic over-merges
     };
     
     const FUSION_CENTROID_THRESHOLD = 0.35;
@@ -2038,20 +2145,50 @@ async function performAIEnsembleFusion(deterministicGroups, tabDataForAI) {
 
     // Strict filtering to avoid noisy AI keywords
     const AI_KEYWORD_STOPWORDS = new Set([
-        'none','update','updates','official','website','home','page','site','general','info',
-        'news','blog','article','the','and','for','with','from','about','choose','000'
+        'none','update','updates','official','website','home','page','site','general','info','portal','index',
+        'news','blog','article','the','and','for','with','from','about','choose','000','recent','recently','latest','new'
     ]);
+    // Generic normalization without hardcoded word mapping
+    function genericNormalize(t) {
+        // Unicode normalize + remove diacritics, keep alnum (en+el) and spaces
+        try {
+            t = String(t || '')
+                .toLowerCase()
+                .normalize('NFKD')
+                .replace(/[\u0300-\u036f]/g, '')
+                .replace(/[^a-z0-9\s\u0370-\u03ff\u1f00-\u1fff]/g, ' ')
+                .replace(/\s+/g, ' ')
+                .trim();
+        } catch (_) {
+            t = String(t || '').toLowerCase().trim();
+        }
+        // conservative normalization
+        if (t.length > 6 && t.endsWith('ing')) {
+            t = t.slice(0, -3); // running -> runn (acceptable for overlap)
+        } else if (t.length > 5 && t.endsWith('ies')) {
+            // accessories -> accessory, policies -> policy
+            t = t.slice(0, -3) + 'y';
+        }
+        return t;
+    }
     function sanitizeKeywords(list) {
         const out = [];
+        const seen = new Set();
         for (const raw of (list || [])) {
-            const t = String(raw || '').toLowerCase().trim();
+            let t = String(raw || '').toLowerCase().trim().replace(/\s+/g, ' ');
             if (!t) continue;
-            if (t.length < 3) continue;
+            if (t.length < 2) continue;
             if (/^\d+$/.test(t)) continue;
-            if (AI_KEYWORD_STOPWORDS.has(t)) continue;
-            if (!out.includes(t)) out.push(t);
+            t = t.replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, '');
+            if (!t || AI_KEYWORD_STOPWORDS.has(t)) continue;
+            t = genericNormalize(t);
+            if (!t || AI_KEYWORD_STOPWORDS.has(t)) continue;
+            if (seen.has(t)) continue;
+            seen.add(t);
+            out.push(t);
         }
-        return out.slice(0, 5);
+        // Allow more keywords now that the prompt requests 8-12
+        return out.slice(0, 12);
     }
     
     // 1. Create shards from deterministic groups
@@ -2078,17 +2215,56 @@ async function performAIEnsembleFusion(deterministicGroups, tabDataForAI) {
                 aiResult.keywords.forEach((kwSet, index) => {
                     // Map local shard index to global tab index
                     const globalIndex = shard.tabIndices[kwSet.index];
-                    const cleaned = sanitizeKeywords(kwSet.keywords);
-                    console.log(`🤖 [Stage 5] Tab ${kwSet.index} (global: ${globalIndex}): [${cleaned.join(', ') || 'none'}]`);
-                    if (cleaned.length >= 2 && typeof globalIndex === 'number') {
+                    const rawKeywords = Array.isArray(kwSet.keywords) ? kwSet.keywords : [];
+                    const cleaned = sanitizeKeywords(rawKeywords);
+                    // Detailed per-tab AI keyword log for diagnostics
+                    try {
+                        const tab = tabDataForAI[globalIndex] || {};
+                        const url = (tab?.url || '').toLowerCase();
+                        const title = (tab?.title || '').toLowerCase();
+                        const heuristicShop = detectShoppingStrong(`${title} ${cleaned.join(' ')}`, url);
+                        console.log('🧩 [AI Keywords]', {
+                            shard: i + 1,
+                            localIndex: kwSet.index,
+                            globalIndex,
+                            title: tab?.title || '',
+                            url: tab?.url || '',
+                            aiShopping: kwSet.shopping === true,
+                            aiShopCategory: kwSet.shopCategory || kwSet.category || null,
+                            aiIntent: typeof kwSet.intent === 'string' ? kwSet.intent : null,
+                            heuristicShopping: heuristicShop,
+                            raw: rawKeywords,
+                            cleaned
+                        });
+                    } catch (_) {}
+                    // Require at least 3 strong keywords to accept AI set
+                    if (cleaned.length >= 3 && typeof globalIndex === 'number') {
                         const tab = tabDataForAI[globalIndex];
                         const url = (tab?.url || '').toLowerCase();
                         const title = (tab?.title || '').toLowerCase();
                         const isShopping = kwSet.shopping === true || detectShoppingStrong(`${title} ${cleaned.join(' ')}`, url);
+                        const allowedCats = new Set(['fashion','electronics','groceries','home','beauty','sports','automotive','digital','general']);
+                        const rawCat = String(kwSet.shopCategory ?? kwSet.category ?? '').toLowerCase().trim();
+                        let shopCategory = isShopping && allowedCats.has(rawCat) ? rawCat : null;
+                        if (isShopping && !shopCategory) {
+                            const inferred = inferShopCategoryFromSignals(tab?.title || '', tab?.url || '', cleaned);
+                            if (allowedCats.has(inferred)) {
+                                shopCategory = inferred;
+                            }
+                        }
+                        let intent = (isShopping && typeof kwSet.intent === 'string' && kwSet.intent.trim())
+                            ? kwSet.intent.trim().toLowerCase().slice(0, 40)
+                            : null;
+                        if (isShopping && !intent) {
+                            const inferredIntent = inferShoppingIntentFromUrl(tab?.url || '', tab?.title || '');
+                            if (inferredIntent) intent = inferredIntent;
+                        }
                         aiSuggestions.set(globalIndex, {
-                            keywords: cleaned.slice(0, 3),
-                            confidence: cleaned.length >= 3 ? 0.75 : 0.6,
-                            isShopping
+                            keywords: cleaned.slice(0, 12),
+                            confidence: cleaned.length >= 8 ? 0.82 : (cleaned.length >= 6 ? 0.78 : (cleaned.length >= 4 ? 0.72 : 0.62)),
+                            isShopping,
+                            shopCategory,
+                            intent
                         });
                     } else {
                         console.log(`🤖 [Stage 5] Ignoring weak AI keywords for tab ${kwSet.index}`);
@@ -2106,13 +2282,20 @@ async function performAIEnsembleFusion(deterministicGroups, tabDataForAI) {
     console.log(`🤖 [Stage 5] AI suggestions collected: ${aiSuggestions.size} tabs`);
     // Populate LAST_AI_KEYWORDS for debug/API access
     try {
-        LAST_AI_KEYWORDS = Array.from(aiSuggestions.entries()).map(([index, info]) => ({
-            index,
-            title: tabDataForAI[index]?.title || '',
-            url: tabDataForAI[index]?.url || '',
-            keywords: Array.isArray(info.keywords) ? info.keywords : [],
-            shopping: Boolean(info.isShopping)
-        }));
+        LAST_AI_KEYWORDS = Array.from(aiSuggestions.entries()).map(([index, info]) => {
+            const title = tabDataForAI[index]?.title || '';
+            const url = tabDataForAI[index]?.url || '';
+            const finalShopping = Boolean(info.isShopping) || detectShoppingStrong(`${String(title).toLowerCase()} ${(info.keywords || []).join(' ')}`, String(url).toLowerCase());
+            return ({
+                index,
+                title,
+                url,
+                keywords: Array.isArray(info.keywords) ? info.keywords : [],
+                shopping: finalShopping,
+                shopCategory: info.shopCategory || null,
+                intent: info.intent || null
+            });
+        });
     } catch (e) {
         console.warn('Failed to populate LAST_AI_KEYWORDS:', e?.message || e);
         LAST_AI_KEYWORDS = [];
@@ -2120,11 +2303,12 @@ async function performAIEnsembleFusion(deterministicGroups, tabDataForAI) {
     
     // Λεπτομερές logging για τα AI suggestions
     if (aiSuggestions.size > 0) {
-        console.log('🤖 [AI Suggestions] AI suggested these tab groupings:');
         const suggestionsArray = Array.from(aiSuggestions.entries());
-        suggestionsArray.forEach(([tabIndex, groupInfo], index) => {
-            console.log(`🤖 [AI Suggestion ${index}] Tab ${tabIndex} → Keywords: [${groupInfo.keywords?.join(', ') || 'none'}]`);
-        });
+        const preview = suggestionsArray.slice(0, 5).map(([tabIndex, info], idx) => ({
+            tabIndex,
+            keywords: (info.keywords || []).slice(0, 6)
+        }));
+        console.log('🤖 [AI Suggestions] Count:', aiSuggestions.size, 'Preview (first 5):', preview);
     } else {
         console.log('⚠️ [AI Suggestions] No AI keywords found - will use fallback keywords');
     }
@@ -2203,7 +2387,7 @@ async function processShardWithAI(shard, tabDataForAI, timeout, retries = 0) {
     // Create compact prompt
     const prompt = createShardPrompt(shardTabs);
     console.log(`🤖 [Stage 5] Created prompt with length: ${prompt.length}`);
-    console.log('🤖 [Stage 5] Prompt being sent to AI:', prompt);
+    // Reduced noise: do not log full prompt content in production logs
     
     // Check cache first (DISABLED for debugging)
     const cacheKey = `ai_shard_${shardTabs.map(t => t.contentHash || t.url).join('_')}`;
@@ -2257,18 +2441,26 @@ function createShardPrompt(shardTabs) {
         return `${index}: "${cleanTitle}" - ${cleanUrl}`;
     }).join('\n');
     
-    return `Analyze these tabs and generate 3-5 keywords per tab describing their main topic/purpose.
-Additionally, for each tab, set a boolean field shopping=true if the tab is primarily about purchasing products (e-commerce, stores, carts, prices, shopping listings), else shopping=false.
-Return ONLY valid JSON in this format: {"keywords":[{"index":0,"keywords":["keyword1","keyword2"],"shopping":false}]}
+    return `Analyze these tabs and generate 8-12 concise, unique keywords per tab that capture distinct main topics/purposes (no duplicates or near-synonym repeats within a tab).
+Additionally, for each tab:
+- Set shopping=true if it is primarily about purchasing products (e-commerce, stores, carts, prices, shopping listings, etc.); otherwise shopping=false. Examples of e-commerce include Amazon, eBay, Target, Temu, SHEIN, BestBuy, Walmart, AliExpress.
+- If shopping=true, also set:
+  • shopCategory: one of fashion | electronics | groceries | home | beauty | sports | automotive | digital | general
+  • intent: a short product/category term that captures the user’s shopping search intent (e.g., "dresses", "gaming accessories", "laptops"). Keep it 1-2 words, lowercase.
+Return ONLY valid JSON in this format: {"keywords":[{"index":0,"keywords":["keyword1","keyword2","keyword3","keyword4"],"shopping":false,"shopCategory":null,"intent":null}]}
 
 Tabs:
 ${tabsInfo}
 
 Requirements:
 - Return ONLY the JSON object
-- Use clear, relevant keywords
-- Keywords should be 1-2 words
-- Focus on main topics, not technical details`;
+    - Use clear, specific keywords (1-2 words)
+    - Avoid generic words: official, website, home, page, site, news, blog, article, update, info, general
+    - Prefer product/category/merchant tokens for shopping tabs (e.g., amazon, bestbuy, chair, accessories)
+    - Make keywords within the same tab distinct (no duplicates/synonyms)
+    - Focus on main topics, not technical details
+    - Crucially: If a tab is clearly from an e-commerce site (like Amazon, Temu, SHEIN, eBay, Target, BestBuy, Walmart, AliExpress), you MUST set shopping=true and provide both shopCategory and intent (non-null).
+    - If shopping is true, you MUST provide a non-null shopCategory and intent`;
 }
 
 /**
@@ -2304,8 +2496,9 @@ async function executeAIGroupingWithTimeout(prompt, timeout) {
         }
     });
 
-    // Try prewarm first
+    // Try prewarm first (small settle to allow content script to attach)
     try {
+        await new Promise(r => setTimeout(r, 150));
         const prewarm = await withTimeout(send('AI_GROUPING_PREWARM'), Math.min(5000, Math.max(2000, timeout - 2000)), 'LM prewarm timeout');
         console.log('🤖 [AI] Prewarm result:', prewarm);
         if (!prewarm || prewarm.success !== true) {
@@ -2314,7 +2507,8 @@ async function executeAIGroupingWithTimeout(prompt, timeout) {
             return { keywords: [], confidence: 0.1 };
         }
     } catch (e) {
-        console.warn('🤖 [AI] Prewarm failed or no receiver:', e?.message || e);
+        // Content script may not be attached yet; attempt recovery quietly
+        console.log('🤖 [AI] Prewarm not received; attempting recovery via injection...');
         // Attempt to inject content script and retry once
         try {
             await chrome.scripting.executeScript({ target: { tabId: usableTab.id }, files: ['content.js'] });
@@ -2393,6 +2587,33 @@ async function performFusionScoring(deterministicGroups, aiSuggestions, tabDataF
             const adaptiveThreshold = adaptiveThresholds && adaptiveThresholds[category] ? adaptiveThresholds[category] : (adaptiveThresholds?.general || 0.25);
             
             if (fusionScore >= adaptiveThreshold) {
+                // Explain why this pair qualifies
+                try {
+                    const detRaw = calculateTabSimilarity(tabI, tabJ);
+                    const det = Number((detRaw / 100).toFixed(3));
+                    const aiI = aiSuggestions.get(i);
+                    const aiJ = aiSuggestions.get(j);
+                    const aiSetI = new Set((aiI?.keywords || []).map(x => String(x).toLowerCase()));
+                    const aiSetJ = new Set((aiJ?.keywords || []).map(x => String(x).toLowerCase()));
+                    const aiInter = [...aiSetI].filter(x => aiSetJ.has(x));
+                    const aiUnion = new Set([...aiSetI, ...aiSetJ]);
+                    const aiJac = aiUnion.size ? (aiInter.length / aiUnion.size) : 0;
+                    const titleTokI = new Set(extractKeywordsFromText(tabI.title));
+                    const titleTokJ = new Set(extractKeywordsFromText(tabJ.title));
+                    const titleInter = [...titleTokI].filter(x => titleTokJ.has(x));
+                    const titleUnionSize = new Set([...titleTokI, ...titleTokJ]).size || 1;
+                    const titleJac = titleInter.length / titleUnionSize;
+                    const taxI = inferTaxonomyFromAIKeywords(aiI, tabI) || (tabI.primaryTopic || 'general');
+                    const taxJ = inferTaxonomyFromAIKeywords(aiJ, tabJ) || (tabJ.primaryTopic || 'general');
+                    console.log(
+                        `🔎 [Fusion Explain] tabs ${i}-${j} | score=${fusionScore.toFixed(3)} thr=${adaptiveThreshold} cat=${category}\n` +
+                        `  • det=${det} | aiJac=${aiJac.toFixed(3)} commonAI=[${aiInter.join(', ')}]\n` +
+                        `  • titleJac=${titleJac.toFixed(3)} commonTitle=[${titleInter.join(', ')}]\n` +
+                        `  • taxI=${taxI} taxJ=${taxJ} aiShop=(${aiI?.isShopping?'Y':'N'},${aiJ?.isShopping?'Y':'N'})`
+                    );
+                } catch (e) {
+                    console.warn('Failed to log fusion explanation:', e?.message || e);
+                }
                 console.log(`🔗 [Fusion] High similarity detected: tabs ${i}-${j}, score: ${fusionScore.toFixed(3)} (threshold: ${adaptiveThreshold}) [category: ${category}]`);
                 
                 // Merge tabs
@@ -2498,8 +2719,8 @@ function inferTaxonomyFromAIKeywords(aiSuggestion, tab) {
         return 'technology';
     }
     
-    // Gaming taxonomy
-    const gamingKeywords = ['gaming', 'game', 'play', 'fifa', 'sport', 'team', 'fc', 'ultimate', 'player', 'ratings', 'squad', 'futbin'];
+    // Gaming taxonomy (generic, no brand-specific phrases)
+    const gamingKeywords = ['gaming', 'game', 'games', 'esports', 'player', 'players', 'ratings', 'squad'];
     if (aiKeywords.some(kw => gamingKeywords.some(gk => kw.includes(gk)))) {
         return 'gaming';
     }
@@ -2519,7 +2740,7 @@ function inferTaxonomyFromAIKeywords(aiSuggestion, tab) {
 function checkSharedKeywords(tabI, tabJ) {
     const medicalKeywords = ['medical', 'health', 'research', 'pubmed', 'nejm', 'clinical', 'treatment', 'patient', 'disease', 'journal', 'medicine', 'england', 'medicalnewstoday', 'ncbi', 'nih'];
     const techKeywords = ['ai', 'artificial intelligence', 'tech', 'software', 'computer', 'digital', 'innovation', 'coding', 'development'];
-    const gamingKeywords = ['gaming', 'game', 'play', 'fifa', 'sport', 'team', 'fc', 'ultimate', 'player', 'ratings', 'squad'];
+    const gamingKeywords = ['gaming', 'game', 'games', 'esports', 'player', 'players', 'ratings', 'squad'];
     
     const titleI = (tabI.title || '').toLowerCase();
     const titleJ = (tabJ.title || '').toLowerCase();
@@ -2570,14 +2791,14 @@ function calculateFusionScore(i, j, aiSuggestions, tabDataForAI, weights) {
     
     if (aiI && aiJ && aiI.keywords && aiJ.keywords && aiI.keywords.length > 0 && aiJ.keywords.length > 0) {
         // Both tabs have AI keywords - calculate similarity using AI keywords
-        const keywords1 = new Set(aiI.keywords);
-        const keywords2 = new Set(aiJ.keywords);
+        const keywords1 = new Set(aiI.keywords.slice(0, 6));
+        const keywords2 = new Set(aiJ.keywords.slice(0, 6));
         const intersection = new Set([...keywords1].filter(x => keywords2.has(x)));
         const union = new Set([...keywords1, ...keywords2]);
         aiAgree = intersection.size / union.size; // Jaccard similarity
     } else if (aiI && aiI.keywords && aiI.keywords.length > 0) {
         // Only tab I has AI keywords - compare with deterministic keywords from tab J
-        const aiKeywords = new Set(aiI.keywords);
+        const aiKeywords = new Set(aiI.keywords.slice(0, 6));
         const titleKeywords = extractKeywordsFromText(tabJ.title);
         const commonKeywords = titleKeywords.filter(kw => aiKeywords.has(kw));
         const allKeywords = [...new Set([...Array.from(aiKeywords), ...titleKeywords])];
@@ -2586,7 +2807,7 @@ function calculateFusionScore(i, j, aiSuggestions, tabDataForAI, weights) {
         }
     } else if (aiJ && aiJ.keywords && aiJ.keywords.length > 0) {
         // Only tab J has AI keywords - compare with deterministic keywords from tab I
-        const aiKeywords = new Set(aiJ.keywords);
+        const aiKeywords = new Set(aiJ.keywords.slice(0, 6));
         const titleKeywords = extractKeywordsFromText(tabI.title);
         const commonKeywords = titleKeywords.filter(kw => aiKeywords.has(kw));
         const allKeywords = [...new Set([...Array.from(aiKeywords), ...titleKeywords])];
@@ -2610,10 +2831,11 @@ function calculateFusionScore(i, j, aiSuggestions, tabDataForAI, weights) {
     const urlJ = (tabJ.url || '').toLowerCase();
     const hostI = (tabI.domain || '').toLowerCase();
     const hostJ = (tabJ.domain || '').toLowerCase();
-    const isShop = (u,h) => /amazon\.|ebay\.|bestbuy\.|target\.|shop|store|cart|checkout/.test(u + ' ' + h);
+    // Use the strong shopping detector everywhere to avoid false positives (e.g. "photoshop")
+    const isShop = (title, u, h) => detectShoppingStrong(`${String(title||'')} ${String(h||'')}`, String(u||''));
     const isGameContent = (t,u,h) => /futbin|fut\.gg|ultimate team|squad|ratings|players|reddit/.test((t||'').toLowerCase() + ' ' + u + ' ' + h);
-    const shoppingI = isShop(urlI, hostI);
-    const shoppingJ = isShop(urlJ, hostJ);
+    const shoppingI = isShop(tabI.title, urlI, hostI);
+    const shoppingJ = isShop(tabJ.title, urlJ, hostJ);
     const gameI = isGameContent(tabI.title, urlI, hostI);
     const gameJ = isGameContent(tabJ.title, urlJ, hostJ);
     // If one is shopping and the other is gameplay/wiki, apply a strong penalty to AI agreement
@@ -2676,6 +2898,41 @@ function calculateFusionScore(i, j, aiSuggestions, tabDataForAI, weights) {
     if (shopConflict || (aiI && aiJ && (aiI.isShopping === true) !== (aiJ.isShopping === true))) {
         score = 0; // force below any threshold
     }
+
+    // Additional guardrails to prevent category leakage
+    const gamingTokens = new Set(['gaming','game','players','squad','esports']);
+    const titleTokensI = new Set(extractKeywordsFromText(tabI.title));
+    const titleTokensJ = new Set(extractKeywordsFromText(tabJ.title));
+
+    // If mixing gaming with non-gaming, demand gaming tokens on BOTH sides
+    if ((catI === 'gaming' && catJ !== 'gaming') || (catJ === 'gaming' && catI !== 'gaming')) {
+        const iHasGaming = Array.from(gamingTokens).some(k => titleTokensI.has(k));
+        const jHasGaming = Array.from(gamingTokens).some(k => titleTokensJ.has(k));
+        if (!(iHasGaming && jHasGaming)) {
+            score = Math.min(score, 0.05);
+        }
+    }
+
+    // If mixing technology/news with gaming, be conservative
+    if ((catI === 'technology' && catJ === 'gaming') || (catJ === 'technology' && catI === 'gaming') ||
+        (catI === 'news' && catJ === 'gaming') || (catJ === 'news' && catI === 'gaming')) {
+        score = Math.min(score, 0.08);
+    }
+
+    // If categories differ and none is shopping, require decent token overlap for general↔topic merges
+    if (catI !== catJ && catI !== 'shopping' && catJ !== 'shopping') {
+        const jaccard = (() => {
+            const a = titleTokensI; const b = titleTokensJ;
+            if (!a.size && !b.size) return 0;
+            let inter = 0;
+            for (const t of a) if (b.has(t)) inter++;
+            const uni = new Set([...a, ...b]).size;
+            return inter / (uni || 1);
+        })();
+        if (jaccard < 0.28) {
+            score = Math.min(score, 0.10);
+        }
+    }
     
     return Math.max(0, Math.min(1, score)); // Clamp to [0,1]
 }
@@ -2711,6 +2968,7 @@ function splitMixedGroups(groups, tabData) {
 
     const result = [];
     for (const group of groups) {
+        // Split and purity logic only; no labeling state here
         const indices = (group.tabIndices || []).slice();
         if (indices.length < 3) { result.push(group); continue; }
 
@@ -2731,6 +2989,17 @@ function splitMixedGroups(groups, tabData) {
         const used = new Set();
         const hasGaming = buckets.gaming.length > 0;
         const gamingMajority = buckets.gaming.length >= Math.ceil(total * 0.5);
+
+        // Global Rule 0: Always split shopping out if mixed with any non-shopping tabs
+        // This prevents commerce pages from polluting topical groups (gaming/tech/medical/etc.)
+        if (buckets.shopping.length >= 1 && (total - buckets.shopping.length) >= 1) {
+            result.push({
+                ...group,
+                tabIndices: buckets.shopping.slice(),
+                primaryTopic: 'shopping'
+            });
+            buckets.shopping.forEach(i => used.add(i));
+        }
 
         // Rule 1: If gaming is majority, keep only gaming in this group
         if (gamingMajority) {
@@ -2803,6 +3072,92 @@ function splitMixedGroups(groups, tabData) {
 }
 
 /**
+ * Further splits shopping groups by shopping category and/or merchant brand.
+ * Categories: fashion, electronics_gaming, other. Within categories, optionally split by merchant.
+ */
+function splitShoppingCategories(groups, tabData) {
+    if (!Array.isArray(groups) || !groups.length) return groups;
+    const result = [];
+    const allowedCats = new Set(['fashion','electronics','groceries','home','beauty','sports','automotive','digital','general']);
+    const mapCat = (c, text) => {
+        if (allowedCats.has(c)) return c;
+        // Heuristic fallback only if AI category missing; avoid domains
+        const s = text || '';
+        if (/(\bfashion\b|\bapparel\b|\bclothes?\b|\bdress(es)?\b|\bshirt\b|\bshirts\b|\bpants\b|\bjeans\b|\bskirt\b|\bshoes?\b|\bsneakers?\b)/i.test(s)) return 'fashion';
+        if (/(\bgaming\b|\baccessor(y|ies)\b|\bpc\b|\blaptop\b|\bmonitor\b|\bkeyboard\b|\bmouse\b|\bheadset\b|\bconsole\b|\bcontroller\b|\bgpu\b|\bcpu\b)/i.test(s)) return 'electronics';
+        return 'general';
+    };
+
+    for (const group of groups) {
+        if (group?.primaryTopic !== 'shopping' || !Array.isArray(group.tabIndices) || group.tabIndices.length < 2) {
+            result.push(group);
+            continue;
+        }
+
+        // First preference: unify by AI-provided intent across different merchants
+        const intentBuckets = new Map(); // intent -> [indices]
+        const intentHosts = new Map();   // intent -> Set(hosts)
+        const getHost = (url) => { try { return new URL(url).hostname.replace(/^www\./,''); } catch { return ''; } };
+        for (const i of group.tabIndices) {
+            const aiMeta = LAST_AI_KEYWORDS.find(e => e.index === i);
+            const intent = (aiMeta && typeof aiMeta.intent === 'string' && aiMeta.intent.trim()) ? aiMeta.intent.trim().toLowerCase() : '';
+            if (!intent) continue;
+            if (!intentBuckets.has(intent)) intentBuckets.set(intent, []);
+            intentBuckets.get(intent).push(i);
+            const host = getHost(tabData?.[i]?.url || '');
+            if (!intentHosts.has(intent)) intentHosts.set(intent, new Set());
+            if (host) intentHosts.get(intent).add(host);
+        }
+        // If there is an intent with 2+ tabs across 2+ different hosts, keep unified as a general shopping intent
+        let unifiedByIntent = false;
+        for (const [intent, indices] of intentBuckets.entries()) {
+            const hosts = intentHosts.get(intent) || new Set();
+            if (indices.length >= 2 && hosts.size >= 2) {
+                const titleTerm = intent.split(/[\s+_-]+/).slice(0, 2).map(t => t.charAt(0).toUpperCase() + t.slice(1)).join(' ');
+                result.push({ ...group, tabIndices: indices.slice(), name: `Shopping · ${titleTerm}`, primaryTopic: 'shopping' });
+                const leftover = group.tabIndices.filter(i => !indices.includes(i));
+                if (leftover.length >= 2) {
+                    // Handle remaining tabs (fall back to category split for leftovers)
+                    result.push({ ...group, tabIndices: leftover });
+                }
+                unifiedByIntent = true;
+                break;
+            }
+        }
+        if (unifiedByIntent) continue;
+
+        const buckets = new Map(); // category -> [indices]
+        const addTo = (cat, idx) => {
+            if (!buckets.has(cat)) buckets.set(cat, []);
+            buckets.get(cat).push(idx);
+        };
+
+        for (const i of group.tabIndices) {
+            const tab = tabData?.[i];
+            const text = `${tab?.title || ''}`.toLowerCase();
+            const aiMeta = LAST_AI_KEYWORDS.find(e => e.index === i);
+            const cat = mapCat(aiMeta?.shopCategory || null, text);
+            addTo(cat, i);
+        }
+        for (const [cat, arr] of buckets.entries()) {
+            if (!arr.length) continue;
+            const label = cat === 'fashion' ? 'Shopping · Fashion'
+                        : cat === 'electronics' ? 'Shopping · Electronics/Gaming'
+                        : cat === 'groceries' ? 'Shopping · Groceries'
+                        : cat === 'home' ? 'Shopping · Home'
+                        : cat === 'beauty' ? 'Shopping · Beauty'
+                        : cat === 'sports' ? 'Shopping · Sports'
+                        : cat === 'automotive' ? 'Shopping · Automotive'
+                        : cat === 'digital' ? 'Shopping · Digital'
+                        : 'Shopping · General';
+            result.push({ ...group, tabIndices: arr.slice(), name: label, primaryTopic: 'shopping' });
+        }
+    }
+
+    // Ensure we didn't accidentally drop tabs: if no split happened, return original groups
+    return result.length ? result : groups;
+}
+/**
  * Διαγράφει όλο το cache για debugging
  */
 async function clearAllCache() {
@@ -2859,8 +3214,149 @@ function mergeFusionGroups(groupA, groupB, score) {
  * Εκτελεί centroid-based fusion
  */
 function performCentroidFusion(groups, threshold) {
-    // Implementation for centroid-based merging
-    return groups;
+    try {
+        const TH = typeof threshold === 'number' ? threshold : 0.35;
+        const MAX_MERGED_SIZE = 10; // keep groups reasonably sized
+        let changed = true;
+        let current = [...groups];
+
+        // Normalize labels by removing punctuation, emojis and collapsing whitespace
+        const normLabel = (v) => {
+            try {
+                return String(v || '')
+                    .toLowerCase()
+                    .normalize('NFKD') // split diacritics
+                    .replace(/[\u0300-\u036f]/g, '') // remove diacritic marks
+                    // keep letters (Latin+Greek), digits and spaces; drop punctuation/emojis/symbols
+                    .replace(/[^a-z0-9\s\u0370-\u03ff\u1f00-\u1fff]/g, ' ')
+                    .replace(/\s+/g, ' ')
+                    .trim();
+            } catch (_) {
+                return String(v || '').toLowerCase().trim();
+            }
+        };
+
+        const jaccard = (a = [], b = []) => {
+            const A = new Set((a || []).map(s => String(s || '').toLowerCase()));
+            const B = new Set((b || []).map(s => String(s || '').toLowerCase()));
+            if (!A.size && !B.size) return 0;
+            const inter = [...A].filter(x => B.has(x));
+            const uni = new Set([...A, ...B]);
+            return inter.length / (uni.size || 1);
+        };
+
+        const MERCHANT_TOKENS = new Set(['amazon','ebay','bestbuy','target','temu','aliexpress','shein','walmart','skroutz','etsy','public','plaisio']);
+        while (changed) {
+            changed = false;
+            outer: for (let i = 0; i < current.length; i++) {
+                for (let j = i + 1; j < current.length; j++) {
+                    const A = current[i];
+                    const B = current[j];
+                    const topicA = A.primaryTopic || 'general';
+                    const topicB = B.primaryTopic || 'general';
+                    // Merge only same-topic (or both general) groups
+                    if (!(topicA === topicB)) continue;
+                    // Size guard
+                    if ((A.tabIndices.length + B.tabIndices.length) > MAX_MERGED_SIZE) continue;
+                    // Keyword centroid similarity (fallback to 0 if none)
+                    const sim = jaccard(A.keywords || [], B.keywords || []);
+                    // Special rule for shopping: allow merging shopping↔shopping when they share merchant tokens or have very high keyword sim
+                    if (topicA === 'shopping' && topicB === 'shopping') {
+                        const kwsA = new Set((A.keywords || []).map(s => String(s).toLowerCase()));
+                        const kwsB = new Set((B.keywords || []).map(s => String(s).toLowerCase()));
+                        const hasMerchant = [...MERCHANT_TOKENS].some(t => kwsA.has(t) && kwsB.has(t));
+                        const nameA = normLabel(A.name || A.label || '');
+                        const nameB = normLabel(B.name || B.label || '');
+                        const sameLabel = nameA && nameB && nameA === nameB;
+                        const labelOk = sameLabel && sim >= 0.50; // label-aware relax
+                        const shoppingOk = hasMerchant || labelOk || sim >= Math.max(TH, 0.55);
+                        if (!shoppingOk) continue;
+                        const reason = hasMerchant ? 'merchant' : (labelOk ? 'label' : 'similarity');
+                        console.log(`🧲 [Centroid Merge] shopping+shopping | sim=${sim.toFixed(3)} | reason=${reason} | labelSame=${sameLabel ? 'Y' : 'N'}`);
+                    } else if (sim < TH) {
+                        continue;
+                    }
+                    if (sim >= TH || (topicA === 'shopping' && topicB === 'shopping')) {
+                        const merged = {
+                            tabIndices: [...new Set([...(A.tabIndices||[]), ...(B.tabIndices||[])])],
+                            primaryTopic: topicA,
+                            keywords: [...new Set([...(A.keywords||[]), ...(B.keywords||[])])].slice(0, 12),
+                            confidence: Math.max(A.confidence||0, B.confidence||0),
+                            fusedBy: 'centroid'
+                        };
+                        current.splice(j, 1);
+                        current.splice(i, 1, merged);
+                        changed = true;
+                        break outer;
+                    }
+                }
+            }
+        }
+        return current;
+    } catch (e) {
+        console.warn('Centroid fusion failed:', e?.message || e);
+        return groups;
+    }
+}
+
+// ---- Post-run RAM cleanup ----
+function schedulePostRunRamCleanup(groups, tabData) {
+    try {
+        setTimeout(() => {
+            performPostRunRamCleanup(groups, tabData).catch(err => {
+                console.warn('Post-run RAM cleanup failed:', err?.message || err);
+            });
+        }, Math.max(0, RAM_CLEANUP_DELAY_MS));
+    } catch (_) {}
+}
+
+async function performPostRunRamCleanup(groups, tabData) {
+    const usedIndices = new Set((groups || []).flatMap(g => Array.isArray(g.tabIndices) ? g.tabIndices : []));
+    const now = Date.now();
+
+    // 1) Prune heavy content from unused tab entries held in memory
+    if (RAM_PRUNE_CONTENT && Array.isArray(tabData)) {
+        for (let i = 0; i < tabData.length; i++) {
+            if (usedIndices.has(i)) continue;
+            const entry = tabData[i];
+            if (!entry) continue;
+            tabData[i] = {
+                id: entry.id,
+                index: entry.index,
+                url: entry.url,
+                title: entry.title,
+                domain: entry.domain,
+                contentHash: entry.contentHash || '',
+                language: entry.language || ''
+            };
+        }
+    }
+
+    // 2) Ask Chrome to discard unused tabs (not active/pinned/audible)
+    if (RAM_DISCARD_UNUSED_TABS) {
+        try {
+            const allTabs = await chrome.tabs.query({});
+            let discards = 0;
+            for (const t of allTabs) {
+                if (discards >= RAM_MAX_DISCARDS_PER_RUN) break;
+                const idx = Array.isArray(tabData) ? tabData.findIndex(e => e && e.id === t.id) : -1;
+                const isUsed = idx >= 0 && usedIndices.has(idx);
+                if (isUsed) continue;
+                if (t.active || t.pinned || t.audible) continue;
+                const ageOk = (now - (t.lastAccessed || now)) >= RAM_MIN_TAB_AGE_MS;
+                if (!ageOk) continue;
+                try {
+                    await chrome.tabs.discard(t.id);
+                    discards += 1;
+                } catch (_) {}
+            }
+            if (discards > 0) {
+                console.log(`🧹 [RAM] Discarded ${discards} unused tabs`);
+            }
+        } catch (discardErr) {
+            console.warn('Tab discard not completed:', discardErr?.message || discardErr);
+        }
+    }
 }
 
 /**
@@ -2991,8 +3487,11 @@ async function performAIAnalysis() {
         logTiming('Embedding generation', embeddingStart);
         console.log('Semantic embeddings generated for all tabs');
         
-        // Use final groups from new pipeline
-        let groups = finalGroups || [];
+        // Use final groups from new pipeline (clamp keyword lists to 10 to reduce noise)
+        let groups = (finalGroups || []).map(g => ({
+            ...g,
+            keywords: Array.isArray(g.keywords) ? g.keywords.slice(0, 10) : []
+        }));
         console.log('🎯 [Smart Pipeline] Using final groups from new architecture');
 
         // Enforce/split by category to reduce cross-topic mixing
@@ -3003,6 +3502,18 @@ async function performAIAnalysis() {
             console.log(`🧹 [Purity] Adjusted group membership to reduce cross-topic mixing (tabs: ${before} → ${after})`);
         } catch (purityErr) {
             console.warn('Purity enforcement failed:', purityErr?.message || purityErr);
+        }
+
+        // Further split shopping groups by category/merchant for better clarity
+        try {
+            const beforeShop = groups.length;
+            groups = splitShoppingCategories(groups, tabDataForAI);
+            const afterShop = groups.length;
+            if (afterShop !== beforeShop) {
+                console.log(`🛍️ [Shopping Split] Refined shopping groups (${beforeShop} → ${afterShop} groups)`);
+            }
+        } catch (shopErr) {
+            console.warn('Shopping split failed:', shopErr?.message || shopErr);
         }
         
         // Create featureContext for compatibility with existing code
@@ -3143,9 +3654,77 @@ async function performAIAnalysis() {
                 group.summaryPending = true;
             }
         });
+
+        // Ensure non-placeholder labels even when AI labeling times out
+        try {
+            const titleCase = (s) => {
+                const t = String(s || '').trim();
+                if (!t) return '';
+                return t.split(/\s+/).map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+            };
+            const placeholderRe = /^group\s+\d+$/i;
+            const pickTop = (arr, n = 2) => (Array.isArray(arr) ? arr.filter(Boolean).slice(0, n) : []);
+            const majorityShopCat = (indices) => {
+                const allowed = new Set(['fashion','electronics','groceries','home','beauty','sports','automotive','digital','general']);
+                const freq = new Map();
+                for (const idx of indices || []) {
+                    const rec = LAST_AI_KEYWORDS.find(e => e.index === idx);
+                    const cat = rec && allowed.has(rec.shopCategory) ? rec.shopCategory : null;
+                    if (!cat) continue;
+                    freq.set(cat, (freq.get(cat) || 0) + 1);
+                }
+                let best = null, bestC = 0;
+                for (const [k, c] of freq.entries()) { if (c > bestC) { best = k; bestC = c; } }
+                return best; // may be null
+            };
+            groups = groups.map((g, idx) => {
+                const hasName = g && g.name && !placeholderRe.test(g.name);
+                if (hasName) return g;
+                let name = '';
+                if ((g.primaryTopic || '').toLowerCase() === 'shopping') {
+                    const maj = majorityShopCat(g.tabIndices);
+                    if (maj) {
+                        const label = maj === 'electronics' ? 'Electronics/Gaming' : titleCase(maj);
+                        name = `Shopping · ${label}`;
+                    } else {
+                        name = 'Shopping Group';
+                    }
+                } else if (g.primaryTopic) {
+                    const t = g.primaryTopic.toLowerCase();
+                    const kw = Array.isArray(g.keywords) ? g.keywords : [];
+                    const has = (s) => kw.includes(s);
+                    if (t === 'gaming') {
+                        if (has('ea') && has('fc')) name = 'EA FC';
+                        else if (has('ultimate') || has('squad')) name = 'Ultimate Team';
+                        else name = 'Gaming';
+                    } else if (t === 'technology') {
+                        const tokens = new Set(kw);
+                        name = tokens.has('ai') ? 'AI Technology' : 'Technology';
+                    } else if (t === 'medical') {
+                        name = 'Medical Research';
+                    } else if (t === 'news') {
+                        name = 'Tech News';
+                    } else if (t === 'general') {
+                        const domain = String(g.domain || '').toLowerCase();
+                        if (domain.includes('docs.google.com')) name = 'Google Docs';
+                        else name = 'General';
+                    } else {
+                        name = titleCase(t);
+                    }
+                } else {
+                    const tokens = pickTop(g.keywords, 2);
+                    name = tokens.length ? titleCase(tokens.join(' ')) : `Group ${idx + 1}`;
+                }
+                return { ...g, name };
+            });
+        } catch (labelErr) {
+            console.warn('Deterministic labeling fallback failed:', labelErr?.message || labelErr);
+        }
         
         aiGroups = groups;
-        scheduleDeferredSummaries();
+        // Prefer labels first to avoid LM contention with summarizer
+        scheduleDeferredLabels(400);
+        scheduleDeferredSummaries(1200);
         
         // Αποθήκευση αποτελεσμάτων
         await chrome.storage.local.set({
@@ -3387,11 +3966,26 @@ async function createTabGroups(aiGroups, tabData) {
                                         }
                                         const shouldRestore = wInfo.state === 'fullscreen';
 
-                                        const subGroupId = await chrome.tabs.group({ tabIds });
-                                        await chrome.tabGroups.update(subGroupId, {
-                                            title: group.name,
-                                            color: getGroupColor(group.name)
-                                        });
+                                        let subGroupId = await chrome.tabs.group({ tabIds });
+                                        // Verify the group exists before updating; handle occasional race where id is invalid
+                                        const tryUpdateGroup = async (groupId) => {
+                                            // Throws if not found
+                                            await chrome.tabGroups.get(groupId);
+                                            await chrome.tabGroups.update(groupId, {
+                                                title: group.name,
+                                                color: getGroupColor(group.name)
+                                            });
+                                            return groupId;
+                                        };
+                                        try {
+                                            subGroupId = await tryUpdateGroup(subGroupId);
+                                        } catch (e) {
+                                            // Retry once by regrouping in case the prior id became invalid
+                                            console.warn(`tabGroups.update failed (will retry): ${e?.message || e}`);
+                                            await new Promise(r => setTimeout(r, 100));
+                                            const retryId = await chrome.tabs.group({ tabIds });
+                                            subGroupId = await tryUpdateGroup(retryId);
+                                        }
                                         anyGroupId = anyGroupId || subGroupId;
                                         tabIds.forEach(tabId => {
                                             const tab = tabData.find(t => t.id === tabId);
@@ -3440,6 +4034,13 @@ async function createTabGroups(aiGroups, tabData) {
         startAutoSuspendScheduler();
         logTiming('Tab grouping pipeline', groupingStart);
         console.log('Tab groups created successfully');
+        try {
+            if (RAM_CLEANUP_ENABLED) {
+                schedulePostRunRamCleanup(aiGroups, tabData);
+            }
+        } catch (ramErr) {
+            console.warn('RAM cleanup scheduling failed:', ramErr?.message || ramErr);
+        }
         
     } catch (error) {
         console.error('Error creating tab groups:', error);
@@ -3624,7 +4225,7 @@ async function performAISummarization(groupContent) {
                                 }
                                 
                                 if ((availability === 'downloadable' || availability === 'downloading') && !(navigator.userActivation && navigator.userActivation.isActive)) {
-                                    throw new Error('Summarizer requires user activation to download. Κάνε κλικ στη σελίδα και δοκίμασε ξανά.');
+                                    throw new Error('Summarizer requires user activation to download. Click the page and try again.');
                                 }
                             } catch (availabilityError) {
                                 console.warn('Content script: Summarizer.availability() failed, continuing optimistically:', availabilityError);
@@ -3940,14 +4541,21 @@ function calculateTabSimilarity(tab1, tab2) {
 }
 
 const STOPWORDS = new Set([
-    'the', 'and', 'with', 'from', 'that', 'this', 'have', 'has', 'will', 'would', 'could', 'should',
-    'about', 'into', 'onto', 'after', 'before', 'while', 'where', 'which', 'their', 'there', 'other',
-    'these', 'those', 'than', 'then', 'when', 'what', 'your', 'yours', 'ours', 'ourselves', 'hers',
-    'his', 'her', 'its', 'they', 'them', 'were', 'was', 'been', 'being', 'because', 'over', 'under',
-    'again', 'further', 'once', 'here', 'every', 'most', 'some', 'such', 'only', 'own', 'same', 'very',
-    'just', 'also', 'like', 'more', 'less', 'many', 'much', 'any', 'each',
-    'http', 'https', 'www', 'com', 'net', 'org', 'html', 'amp', 'php', 'utm', 'ref', 'aspx', 'index',
-    'home', 'main', 'default', 'article', 'video', 'watch', 'channel', 'official'
+    // English common stopwords and function words
+    'the','and','with','from','that','this','have','has','will','would','could','should',
+    'about','into','onto','after','before','while','where','which','their','there','other',
+    'these','those','than','then','when','what','your','yours','ours','ourselves','hers',
+    'his','her','its','they','them','were','was','been','being','because','over','under',
+    'again','further','once','here','every','most','some','such','only','own','same','very',
+    'just','also','like','more','less','many','much','any','each','an','a','is','are','it','as',
+    'per','via','for','to','of','in','on','at','by','up','down','out','across','between','among','through',
+    // URL/tech noise
+    'http','https','www','com','net','org','html','amp','php','utm','ref','aspx','index',
+    // Generic site words
+    'home','main','default','article','video','watch','channel','official',
+    // Greek common stopwords
+    'και','για','στο','στη','στην','στον','των','του','της','τα','τις','ο','η','το','ένα','μια','ένας',
+    'σε','με','από','προς','κατά','χωρίς','ως','όπως','είναι'
 ]);
 
 function extractMeaningfulKeywords(text) {
@@ -4034,7 +4642,7 @@ function inferTaxonomyTags(entry) {
             tags.add('browser');
         }
         if (combinedSignals.includes('fifa') || combinedSignals.includes('ultimate team') || combinedSignals.includes('fc 26')) {
-            tags.add('fifa ultimate team');
+            // Avoid brand-specific taxonomy; keep it general
             tags.add('gaming');
         }
         if (combinedSignals.includes('news')) {
@@ -4062,14 +4670,30 @@ function inferTaxonomyTags(entry) {
  */
 async function findUsableAIAccessTab() {
     const tabs = await chrome.tabs.query({});
-    return tabs.find(tab =>
-        tab.url &&
-        !tab.url.startsWith('chrome://') &&
-        !tab.url.startsWith('chrome-extension://') &&
-        !tab.url.startsWith('moz-extension://') &&
-        !tab.url.startsWith('edge://') &&
-        tab.url.startsWith('http')
-    ) || null;
+    const httpTabs = tabs.filter(tab => tab.url && tab.url.startsWith('http'));
+    if (!httpTabs.length) return null;
+    // Prefer light, static tabs (avoid very heavy pages) using simple heuristics
+    const preferHosts = new Set(['openai.com','blog.google','developer.chrome.com']);
+    const avoidHosts = new Set([
+        'ea.com','futbin.com','fut.gg','who.int','calendar.google.com','docs.google.com','drive.google.com'
+    ]);
+    const tabById = new Map(currentTabData.map((t, idx) => [t.id, { idx, entry: t }]));
+    const scoreTab = (tab) => {
+        const url = tab.url || '';
+        let host = '';
+        try { host = new URL(url).hostname.replace(/^www\./,''); } catch {}
+        let score = 0;
+        if (preferHosts.has(host)) score += 3;
+        if (avoidHosts.has(host)) score -= 3;
+        const td = tabById.get(tab.id)?.entry;
+        const contentLen = td && typeof td.content === 'string' ? td.content.length : 0;
+        if (contentLen && contentLen < 1200) score += 1; // lighter page
+        if (/news|blog/i.test(td?.title || '')) score += 1;
+        if (/download|video|player/i.test(td?.title || '')) score -= 1;
+        return score;
+    };
+    httpTabs.sort((a, b) => scoreTab(b) - scoreTab(a));
+    return httpTabs[0] || null;
 }
 
 /**
@@ -6309,6 +6933,21 @@ function mergeSimilarNamedGroups(groups, featureContext, { debugLog = null } = {
         return /(tech|news|ai|openai|techcrunch|the verge|google)/.test(s) || (g?.primaryTopic === 'technology');
     };
 
+    // Normalizer for exact label equality checks (remove punctuation/emojis, collapse spaces)
+    const normName = (v) => {
+        try {
+            return String(v || '')
+                .toLowerCase()
+                .normalize('NFKD')
+                .replace(/[\u0300-\u036f]/g, '')
+                .replace(/[^a-z0-9\s\u0370-\u03ff\u1f00-\u1fff]/g, ' ')
+                .replace(/\s+/g, ' ')
+                .trim();
+        } catch (_) {
+            return String(v || '').toLowerCase().trim();
+        }
+    };
+
     for (let i = 0; i < groups.length; i++) {
         for (let j = i + 1; j < groups.length; j++) {
             // Guard: do not merge across major categories (gaming/shopping/medical/tech)
@@ -6324,6 +6963,32 @@ function mergeSimilarNamedGroups(groups, featureContext, { debugLog = null } = {
             const ta = isTechNewsGroup(groups[i]);
             const tb = isTechNewsGroup(groups[j]);
             if (ta !== tb) continue;
+
+            // Special fast path: shopping groups with identical normalized labels
+            if (sa && sb) {
+                const nameA = normName(groups[i].name);
+                const nameB = normName(groups[j].name);
+                if (nameA && nameB && nameA === nameB && !isPlaceholderGroupName(groups[i].name) && !isPlaceholderGroupName(groups[j].name)) {
+                    uf.union(i, j);
+                    merged = true;
+                    mergeSummaries.push({ a: groups[i].name, b: groups[j].name, labelEquality: true });
+                    if (debugLog) {
+                        debugLog.stats = debugLog.stats || {};
+                        debugLog.stats.nameUnions = (debugLog.stats.nameUnions || 0) + 1;
+                        debugLog.nameMerges = debugLog.nameMerges || [];
+                        debugLog.nameMerges.push({
+                            phase: 'B',
+                            type: 'label-merge',
+                            reason: 'label-equal',
+                            groups: [i, j],
+                            names: [groups[i].name, groups[j].name],
+                            primaryTopics: [groups[i].primaryTopic || '', groups[j].primaryTopic || ''],
+                            timestamp: Date.now()
+                        });
+                    }
+                    continue; // proceed to next pair
+                }
+            }
 
             const tokensA = nameTokenSets[i];
             const tokensB = nameTokenSets[j];
@@ -6420,14 +7085,36 @@ function mergeSimilarNamedGroups(groups, featureContext, { debugLog = null } = {
     
     const mergedGroups = Array.from(mergedMap.values()).map(bucket => {
         const vectorList = Array.from(bucket.vectorIndices);
-        const enriched = enrichGroupFromVectors(vectorList, vectors, similarityCache);
-        const candidateNames = bucket.names
+        const nameCandidate = bucket.names
             .filter(name => name && !isPlaceholderGroupName(name))
-            .sort((a, b) => b.length - a.length);
-        const fallbackNames = bucket.names.slice().sort((a, b) => b.length - a.length);
-        enriched.name = candidateNames[0] || fallbackNames[0] || enriched.name || 'Group';
-        enriched.summary = [];
-        return enriched;
+            .sort((a, b) => b.length - a.length)[0] || bucket.names[0] || 'Group';
+        if (vectorList.length > 0) {
+            const enriched = enrichGroupFromVectors(vectorList, vectors, similarityCache);
+            enriched.name = nameCandidate || enriched.name || 'Group';
+            enriched.summary = [];
+            return enriched;
+        }
+        // Fallback: groups didn't carry vectorIndices (e.g., came from earlier pipeline)
+        const tabIdxArr = Array.from(bucket.tabIndices).sort((a, b) => a - b);
+        return {
+            tabIndices: tabIdxArr,
+            vectorIndices: [],
+            keywords: [],
+            centroidTokens: [],
+            centroidSignature: `manual|${tabIdxArr.join('|')}`,
+            domainMode: '',
+            languageMode: '',
+            representativeTabIndices: tabIdxArr.slice(0, Math.min(2, tabIdxArr.length)),
+            taxonomyTags: [],
+            mergeHints: [],
+            primaryTopic: '',
+            docType: '',
+            entities: [],
+            genericLandingRatio: 0,
+            primaryTopicPurity: 0,
+            name: nameCandidate,
+            summary: []
+        };
     });
     
     mergedGroups.sort((a, b) => b.tabIndices.length - a.tabIndices.length || a.tabIndices[0] - b.tabIndices[0]);
@@ -6502,6 +7189,14 @@ function titleCaseFromTokens(tokens) {
 }
 
 async function assignGroupLabels(groups, tabDataForAI) {
+    const LABELING_BUDGET_MS = 15000; // overall budget for labeling to avoid long stalls
+    const labelingStartTs = Date.now();
+    if (labelingActive) {
+        // Another labeling session is running; defer
+        scheduleDeferredLabels(800);
+        return;
+    }
+    labelingActive = true;
     const accessibleTab = await findUsableAIAccessTab();
     const { groupLabelCache = {} } = await chrome.storage.session.get(['groupLabelCache']);
     const updatedCache = { ...groupLabelCache };
@@ -6547,6 +7242,43 @@ async function assignGroupLabels(groups, tabDataForAI) {
         }
         return `Highlights include ${unique[0]}, ${unique[1]} and ${unique[2]}`;
     };
+
+    // Heuristic: detect overly generic/weak labels that don't help users
+    const isWeakLabel = (label = '') => {
+        const s = String(label || '').toLowerCase().trim();
+        if (!s) return true;
+        const generic = /(\bgeneral\b|\bonline\b|\bweb\b|\bbrowse\b|\binfo\b|\bgroup\b)/i;
+        return generic.test(s) || s.length < 3;
+    };
+
+    // Build a better shopping label using AI intents or categories
+    const buildShoppingLabel = (group) => {
+        try {
+            const intents = new Map();
+            const cats = new Map();
+            for (const idx of (group.tabIndices || [])) {
+                const rec = Array.isArray(LAST_AI_KEYWORDS) ? LAST_AI_KEYWORDS.find(e => e.index === idx) : null;
+                if (!rec) continue;
+                if (rec.intent) intents.set(rec.intent, (intents.get(rec.intent) || 0) + 1);
+                if (rec.shopCategory) cats.set(rec.shopCategory, (cats.get(rec.shopCategory) || 0) + 1);
+            }
+            let bestIntent = '';
+            let bestIntentC = 0;
+            for (const [k, c] of intents.entries()) { if (c > bestIntentC) { bestIntent = k; bestIntentC = c; } }
+            if (bestIntent) {
+                const title = bestIntent.split(/[\s+_-]+/).slice(0, 2).map(t => t.charAt(0).toUpperCase() + t.slice(1)).join(' ');
+                return `Shopping · ${title}`;
+            }
+            let bestCat = '';
+            let bestCatC = 0;
+            for (const [k, c] of cats.entries()) { if (c > bestCatC) { bestCat = k; bestCatC = c; } }
+            if (bestCat) {
+                const title = bestCat === 'electronics' ? 'Electronics/Gaming' : (bestCat.charAt(0).toUpperCase() + bestCat.slice(1));
+                return `Shopping · ${title}`;
+            }
+        } catch (_) {}
+        return '';
+    };
     
     if (!accessibleTab) {
         labelFailureReasons.add('No accessible tab with Chrome AI support');
@@ -6579,7 +7311,29 @@ async function assignGroupLabels(groups, tabDataForAI) {
         }
     }
 
+    // Prewarm the language model session once to avoid first-call latency
+    if (accessibleTab && aiLabelReady) {
+        try {
+            // Small settle delay to avoid contention immediately after reload
+            await new Promise(r => setTimeout(r, 500));
+            await withTimeout(
+                chrome.scripting.executeScript({
+                    target: { tabId: accessibleTab.id },
+                    world: 'MAIN',
+                    func: generateGroupLabelInPage,
+                    args: [{ mode: 'warmup' }]
+                }),
+                AI_LABEL_TIMEOUT,
+                'AI label warmup timeout'
+            );
+        } catch (_) {
+            // warmup best-effort
+        }
+    }
+
     for (const group of groups) {
+        let attemptedThisGroup = false;
+        let succeededThisGroup = false;
         const centroidSignature = group.centroidSignature || '';
         let cachedEntry = centroidSignature ? updatedCache[centroidSignature] : null;
         if (cachedEntry && (Date.now() - cachedEntry.timestamp) >= LABEL_CACHE_TTL) {
@@ -6621,25 +7375,33 @@ async function assignGroupLabels(groups, tabDataForAI) {
             genericLandingRatio: typeof group.genericLandingRatio === 'number' ? group.genericLandingRatio : 0
         };
 
+        // Respect overall labeling budget
+        if ((Date.now() - labelingStartTs) > LABELING_BUDGET_MS) {
+            console.log('⏱️ [AI Label] Labeling budget exceeded; skipping remaining groups');
+            break;
+        }
         if ((!label || !blurb) && accessibleTab && aiLabelReady && aiLabelAttempts < MAX_AI_LABEL_GROUPS) {
             try {
                 aiLabelAttempts += 1;
-                console.log(`🧠 [AI Label] Attempting to generate label for group ${groups.indexOf(group) + 1} (attempt ${aiLabelAttempts}/${MAX_AI_LABEL_GROUPS})`);
-                const scriptPromise = chrome.scripting.executeScript({
+                attemptedThisGroup = true;
+                console.log(`🧠 [AI Label] Attempting label for group ${groups.indexOf(group) + 1} (attempt ${aiLabelAttempts}/${MAX_AI_LABEL_GROUPS})`);
+                const fullPromise = chrome.scripting.executeScript({
                     target: { tabId: accessibleTab.id },
                     world: 'MAIN',
                     func: generateGroupLabelInPage,
                     args: [descriptor]
                 });
-                const results = await withTimeout(scriptPromise, AI_LABEL_TIMEOUT, 'AI label timeout');
-                
+                // Short settle to reduce first-call contention
+                await new Promise(r => setTimeout(r, 250));
+                const results = await withTimeout(fullPromise, AI_LABEL_TIMEOUT, 'AI label timeout');
                 const payload = results && results[0] && results[0].result;
                 if (payload && payload.ok && payload.label) {
-                    label = payload.label;
+                    label = String(payload.label).trim();
                     if (payload.blurb) {
                         blurb = String(payload.blurb).trim().slice(0, 160);
                     }
-                    console.log(`✅ [AI Label] Successfully generated label: "${label}" for group ${groups.indexOf(group) + 1}`);
+                    console.log(`✅ [AI Label] Label: "${label}" for group ${groups.indexOf(group) + 1}`);
+                    succeededThisGroup = true;
                 } else if (payload && !payload.ok) {
                     const status = results[0].result.status || null;
                     const errorMessage = results[0].result.error || 'Language model not ready';
@@ -6653,11 +7415,7 @@ async function assignGroupLabels(groups, tabDataForAI) {
                 console.warn('Group label generation failed:', error);
                 const message = error?.message || String(error);
                 labelFailureReasons.add(message);
-                if (message === 'AI label timeout') {
-                    aiLabelReady = false;
-                    aiLabelReason = 'Language model timeout';
-                    console.warn('Group label generation timed out, using fallback label.');
-                }
+                succeededThisGroup = false;
             }
         } else if (!label && accessibleTab && aiLabelChecksFailed && !aiLabelReady) {
             labelFailureReasons.add(aiLabelReason);
@@ -6692,6 +7450,12 @@ async function assignGroupLabels(groups, tabDataForAI) {
                 label = `Group ${groups.indexOf(group) + 1}`;
             }
         }
+        // If label is too generic, try to improve using shopping intent/category
+        if (isWeakLabel(label) && (group.primaryTopic || '').toLowerCase() === 'shopping') {
+            const improved = buildShoppingLabel(group);
+            if (improved) label = improved;
+        }
+
         if (!blurb) {
             blurb = buildFallbackBlurb(descriptor, group, label);
         }
@@ -6707,6 +7471,25 @@ async function assignGroupLabels(groups, tabDataForAI) {
         group.displayBlurb = blurb;
         group.oneLiner = blurb;
         group.blurb = blurb;
+        // If a Chrome tab group was already created, update its title now
+        if (group.chromeGroupId) {
+            try {
+                await chrome.tabGroups.update(group.chromeGroupId, {
+                    title: group.name,
+                    color: getGroupColor(group.name)
+                });
+            } catch (e) {
+                console.warn('Failed to update existing Chrome group title:', e?.message || e);
+            }
+        }
+
+        // Cooldown between consecutive AI label calls to reduce timeouts
+        if (attemptedThisGroup) {
+            try {
+                const waitMs = succeededThisGroup ? AI_LABEL_COOLDOWN_SUCCESS_MS : AI_LABEL_COOLDOWN_FAILURE_MS;
+                await new Promise(r => setTimeout(r, waitMs));
+            } catch (_) {}
+        }
     }
     
     if (cacheDirty) {
@@ -6716,6 +7499,7 @@ async function assignGroupLabels(groups, tabDataForAI) {
     if (labelFailureReasons.size > 0) {
         console.info('Group labeling used fallback:', Array.from(labelFailureReasons).slice(0, 3).join(' | '));
     }
+    labelingActive = false;
 }
 
 async function generateGroupSummaries(groups) {
@@ -6730,6 +7514,67 @@ async function generateGroupSummaries(groups) {
             group.summary = Array.isArray(group.summary) ? group.summary : [];
             group.summaryPending = !group.summary.length;
         }
+    }
+}
+
+// Deferred AI labeling (post-pipeline) to finish labeling remaining groups gradually
+function scheduleDeferredLabels(delay = 600) {
+    if (!Array.isArray(aiGroups) || !aiGroups.length) {
+        return;
+    }
+    if (deferredLabelTimer) {
+        clearTimeout(deferredLabelTimer);
+    }
+    deferredLabelTimer = setTimeout(() => {
+        deferredLabelTimer = null;
+        processDeferredLabels().catch(err => console.warn('Deferred label processing failed:', err?.message || err));
+    }, delay);
+}
+
+async function processDeferredLabels() {
+    if (deferredLabelInProgress) {
+        scheduleDeferredLabels(1000);
+        return;
+    }
+    if (!Array.isArray(aiGroups) || !aiGroups.length) {
+        try {
+            const storedGroups = await chrome.storage.local.get(['cachedGroups']);
+            if (Array.isArray(storedGroups.cachedGroups)) {
+                aiGroups = storedGroups.cachedGroups;
+            }
+        } catch (storageError) {
+            console.warn('Failed to load cached groups for labeling:', storageError);
+        }
+    }
+    if (!Array.isArray(aiGroups) || !aiGroups.length) return;
+
+    // Helper: detect placeholder/deterministic names we want to upgrade via AI
+    const placeholderRe = /^Group\s+\d+$/i;
+    const genericNames = new Set(['General Group','Shopping Group','Technology Group','Gaming Group','Medical Group','News Group']);
+    const needsAIName = (g) => !g || !g.name || placeholderRe.test(g.name) || genericNames.has(String(g.name));
+
+    try {
+        deferredLabelInProgress = true;
+        // Prefer larger groups first
+        const candidates = aiGroups
+            .map((g, idx) => ({ g, idx }))
+            .filter(({ g }) => needsAIName(g))
+            .sort((a, b) => (b.g.tabIndices?.length || 0) - (a.g.tabIndices?.length || 0));
+
+        if (!candidates.length) return;
+
+        // Label 1 group per pass to minimize contention with summarizer/LM
+        const slice = candidates.slice(0, 1).map(c => c.g);
+        await assignGroupLabels(slice, currentTabData);
+
+        // Persist updates
+        await synchronizeCachedGroups();
+
+        // If more remain, schedule another pass
+        const remaining = aiGroups.some(g => needsAIName(g));
+        if (remaining) scheduleDeferredLabels(1200);
+    } finally {
+        deferredLabelInProgress = false;
     }
 }
 
@@ -6763,6 +7608,11 @@ async function processDeferredSummaries() {
     if (deferredSummaryInProgress) {
         // Reschedule to ensure new groups are processed after current run
         scheduleDeferredSummaries(600);
+        return;
+    }
+    if (labelingActive || deferredLabelInProgress) {
+        // Avoid contention with label LM usage
+        scheduleDeferredSummaries(1200);
         return;
     }
     if (!Array.isArray(aiGroups) || !aiGroups.length) {
@@ -6871,7 +7721,7 @@ async function handleGroupSummaryRequest(groupIndex) {
     
     if (group.centroidSignature) {
         groupSummaryCache[group.centroidSignature] = {
-            summary,
+            summary: Array.isArray(group.summary) ? group.summary : [],
             timestamp: Date.now()
         };
         await chrome.storage.session.set({ groupSummaryCache });
@@ -7926,6 +8776,11 @@ function generateGroupLabelInPage(descriptor) {
             try {
                 const session = await getSession(forceReset);
                 
+                // Warmup mode: just create a session and return
+                if (descriptor && descriptor.mode === 'warmup') {
+                    return { ok: true, warmup: true };
+                }
+
                 const centroidLine = (descriptor.centroidKeywords || []).join(', ') || 'none';
                 const fallbackLine = (descriptor.fallbackKeywords || []).join(', ') || 'none';
                 const primaryTopicLine = descriptor.primaryTopic || 'unknown';
@@ -7948,7 +8803,21 @@ TAB ${idx + 1}
                 `.trim()).join('\n\n') || 'No exemplar tabs provided.';
                 
                 const taxonomyLine = (descriptor.taxonomyTags || []).join(', ') || 'none';
-                const prompt = `
+                const isLite = descriptor && descriptor.mode === 'lite';
+                const prompt = isLite ? `
+Return STRICT JSON: {"label":"<2-3 word title>"}
+
+Rules:
+- English, 2-3 words max
+- Specific to shared subject, no emojis, no punctuation
+- Do not repeat words
+
+Context:
+Centroid: ${centroidLine}
+Keywords: ${fallbackLine}
+Taxonomy: ${taxonomyLine}
+Primary topic: ${primaryTopicLine}
+Domain: ${descriptor.domainMode || 'unknown'}`.trim() : `
 You generate concise labels and one-line blurbs for groups of browser tabs.
 Return STRICT JSON: {"label":"<2-4 word title>","blurb":"<6-12 word one-liner>"}
 
@@ -8012,7 +8881,7 @@ ${tabLines}
                 if (!label) {
                     throw new Error('No label returned');
                 }
-                const blurb = String(parsed.blurb || '').trim().slice(0, 160);
+                const blurb = isLite ? '' : String(parsed.blurb || '').trim().slice(0, 160);
                 
                 console.log('🧠 [GroupLabel] Parsed result:', {
                     label: label,
