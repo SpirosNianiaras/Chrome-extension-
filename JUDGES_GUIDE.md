@@ -51,7 +51,7 @@ Open 10-15 tabs across a few distinct topics. We suggest including the following
 
 ### Step 3: See the "AI Synthesis" (The Core Feature)
 
-1. In the popup, click on one of the groups you just created (e.g., "Sports Fc™ Website").
+1. In the popup, click on one of the groups you just created (e.g., "Medical").
 2. The view will expand, instantly showing a short, AI-generated summary describing the purpose of that group.
 3. Click the button inside that group (e.g., "View Full Analysis").
 4. A new tab will open, displaying a full, beautifully formatted **AI Synthesis Report**. This report includes the core subject, a detailed summary, and key insights extracted by comparing the tabs in the group.
